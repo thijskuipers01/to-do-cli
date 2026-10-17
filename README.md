@@ -28,6 +28,7 @@ $ todo list --pending --sort due
 - **Multiple lists** (`--list Shopping`)
 - A macOS **notification** for tasks due tomorrow
 - **Tab completion** for zsh, bash and fish
+- **JSON output** (`--json`) for scripts and AI assistants
 
 ## Requirements
 
@@ -106,6 +107,35 @@ Run `todo --help` or `todo <command> --help` for every option.
 | `completions <shell>` | Print a completion script (`zsh`, `bash`, `fish`, ...) |
 
 Every command also accepts `-l/--list <name>` to work on another Reminders list.
+
+### JSON output
+
+Add `--json` to get machine-readable output, for scripts or an AI assistant
+that manages your tasks through `todo`. `list` and `today` print an array of
+tasks, `show` prints one task, and `add`, `edit`, `done` and `remove` print the
+task they changed (so you get the ID of a new task back). `undo` prints
+`{"undone": "..."}`, or `{"undone": null}` when there is nothing to undo.
+Errors still go to stderr with a non-zero exit code.
+
+```sh
+$ todo add "Dentist" --due friday --priority high --tag health --json
+{
+  "id": 12,
+  "title": "Dentist",
+  "done": false,
+  "due": "2026-10-23",
+  "priority": "high",
+  "tags": [
+    "health"
+  ],
+  "notes": "",
+  "repeat": null,
+  "list": "Todo"
+}
+```
+
+Values use the same words as the options (`"high"`, `"every 2 weeks"`), so
+they can be passed straight back to `add` or `edit`. Empty fields are `null`.
 
 ### Input formats
 

@@ -3,6 +3,7 @@ use std::fmt::Write;
 use chrono::NaiveDate;
 use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
+use serde::Serialize;
 
 use todo::model::{self, DueStatus, Priority, Task};
 
@@ -19,6 +20,54 @@ pub fn print_tasks(tasks: &[Task]) {
 /// Prints every detail of one task, including its notes.
 pub fn print_task_details(task: &Task) {
     print!("{}", task_details(task, model::today()));
+}
+
+/// Prints tasks as a JSON array, one object per task (see [`JsonTask`]).
+pub fn print_tasks_json(tasks: &[Task]) -> serde_json::Result<()> {
+    let tasks: Vec<JsonTask> = tasks.iter().map(JsonTask::from).collect();
+    println!("{}", serde_json::to_string_pretty(&tasks)?);
+    Ok(())
+}
+
+/// Prints one task as a JSON object (see [`JsonTask`]).
+pub fn print_task_json(task: &Task) -> serde_json::Result<()> {
+    println!("{}", serde_json::to_string_pretty(&JsonTask::from(task))?);
+    Ok(())
+}
+
+/// A task as JSON output shows it. Unlike `Task`'s own serialization (used
+/// for the undo history), the values use the same words as the command-line
+/// options, so they can be passed straight back: `"high"`, `"every 2 weeks"`.
+#[derive(Serialize)]
+struct JsonTask<'a> {
+    id: i64,
+    title: &'a str,
+    done: bool,
+    due: Option<NaiveDate>,
+    priority: Option<&'static str>,
+    tags: &'a [String],
+    notes: &'a str,
+    repeat: Option<String>,
+    list: &'a str,
+}
+
+impl<'a> From<&'a Task> for JsonTask<'a> {
+    fn from(task: &'a Task) -> JsonTask<'a> {
+        JsonTask {
+            id: task.id,
+            title: &task.title,
+            done: task.done,
+            due: task.due,
+            priority: match task.priority {
+                Priority::None => None,
+                priority => Some(priority.label()),
+            },
+            tags: &task.tags,
+            notes: &task.notes,
+            repeat: task.repeat.map(|r| r.label()),
+            list: &task.list,
+        }
+    }
 }
 
 fn tasks_table(tasks: &[Task], today: NaiveDate) -> Table {
@@ -173,6 +222,33 @@ mod tests {
         for label in ["Due", "Repeats", "Priority", "Tags", "Notes"] {
             let line = details.lines().find(|l| l.trim_start().starts_with(label)).unwrap();
             assert!(line.ends_with(" -"), "{label} should be a dash: {line:?}");
+        }
+    }
+
+    #[test]
+    fn json_uses_command_line_words() {
+        let value = serde_json::to_value(JsonTask::from(&full_task())).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": 7,
+                "title": "Weekly sync",
+                "done": false,
+                "due": "2026-10-20",
+                "priority": "high",
+                "tags": ["work", "urgent"],
+                "notes": "Bring the report\nand slides",
+                "repeat": "every 2 weeks",
+                "list": "Todo",
+            })
+        );
+    }
+
+    #[test]
+    fn json_uses_null_for_empty_fields() {
+        let value = serde_json::to_value(JsonTask::from(&Task::new("Bare"))).unwrap();
+        for field in ["due", "priority", "repeat"] {
+            assert!(value[field].is_null(), "{field} should be null: {value}");
         }
     }
 
