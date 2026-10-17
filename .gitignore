@@ -1,0 +1,5 @@
+# Build output
+/target
+
+# Local task data created when running the CLI in this directory
+tasks.json
