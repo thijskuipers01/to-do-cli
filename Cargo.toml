@@ -2,18 +2,37 @@
 name = "todo"
 version = "0.1.0"
 edition = "2024"
+description = "A to-do list stored in Apple Reminders, with a library, a CLI and a terminal UI"
+readme = "README.md"
+
+[lib]
+path = "src/lib.rs"
+
+# The command-line program. It needs the `cli` feature, which is on by default.
+[[bin]]
+name = "todo"
+path = "src/bin/todo/main.rs"
+required-features = ["cli"]
+doc = false # the library has the same name; document only the library
+
+[features]
+default = ["cli"]
+# Everything the `todo` program needs on top of the library.
+cli = ["dep:clap", "dep:clap_complete", "dep:comfy-table", "dep:ratatui"]
 
 [dependencies]
 anyhow = "1.0.104"
 block2 = "0.6.2"
 chrono = { version = "0.4.45", features = ["serde"] }
-clap = { version = "4.6.7", features = ["derive", "env"] }
-clap_complete = "4.6.11"
-comfy-table = "8.0.1"
 objc2 = "0.6.5"
 objc2-event-kit = "0.3.2"
 objc2-foundation = "0.3.2"
-ratatui = "0.30.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+# Only for the `cli` feature.
+clap = { version = "4.6.7", features = ["derive", "env"], optional = true }
+clap_complete = { version = "4.6.11", optional = true }
+comfy-table = { version = "8.0.1", optional = true }
+ratatui = { version = "0.30.2", optional = true }

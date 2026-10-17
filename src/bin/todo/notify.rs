@@ -3,14 +3,13 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use chrono::{Days, NaiveDate};
 
-use crate::reminders::Backend;
-use crate::store::{Filter, Store};
-use crate::task;
+use todo::model;
+use todo::{Backend, Filter, Store};
 
 /// Shows a desktop notification listing the unfinished tasks due tomorrow.
 /// Does nothing when there are none.
 pub fn due_tomorrow<B: Backend>(db: &Store<B>) -> Result<()> {
-    let titles = titles_due_on(db, task::today() + Days::new(1))?;
+    let titles = titles_due_on(db, model::today() + Days::new(1))?;
     match notification(&titles) {
         None => println!("No tasks due tomorrow"),
         Some((heading, body)) => {
@@ -71,8 +70,7 @@ fn show(heading: &str, body: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::Task;
-    use crate::testing;
+    use todo::Task;
 
     fn date(text: &str) -> NaiveDate {
         text.parse().unwrap()
@@ -80,7 +78,7 @@ mod tests {
 
     #[test]
     fn titles_due_on_skips_other_dates_and_finished_tasks() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         let due = Some(date("2026-10-18"));
         db.add(&Task { due, ..Task::new("Dentist") }).unwrap();
         db.add(&Task { due: Some(date("2026-10-19")), ..Task::new("Later") }).unwrap();

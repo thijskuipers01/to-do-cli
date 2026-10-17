@@ -37,16 +37,36 @@ $ todo list --pending --sort due
 
 ## Installation
 
+Install straight from GitHub:
+
 ```sh
-git clone <this repository>
+cargo install --git https://github.com/thijskuipers01/to-do-cli
+```
+
+Or from a local copy, for example after making your own changes:
+
+```sh
+git clone https://github.com/thijskuipers01/to-do-cli.git
 cd to-do-cli
 cargo install --path .
 ```
 
-This puts the `todo` command in `~/.cargo/bin`. The first time you run it,
-macOS asks for permission to access Reminders. Click **Allow**. If you
-declined by accident, turn it on under **System Settings → Privacy & Security
-→ Reminders** for your terminal app.
+Either way, Cargo builds the program and puts the `todo` command in
+`~/.cargo/bin`, which the Rust installer adds to your `PATH`. Open a new
+terminal and `todo` works from any folder; you don't need `cargo run` or the
+source code anymore.
+
+**First run.** macOS asks for permission to access Reminders. Click
+**Allow**. If you declined by accident, turn it on under **System Settings →
+Privacy & Security → Reminders** for your terminal app. Your tasks then go
+in the **Todo** list of the Apple account you're signed in with.
+
+**Updating.** Run the same `cargo install` command again; add `--force` to
+reinstall when the version number hasn't changed.
+
+**Uninstalling.** Run `cargo uninstall todo`. Your tasks stay in Reminders;
+delete `~/.local/share/todo/` to remove the local task numbers and undo
+history as well.
 
 ## Usage
 
@@ -171,25 +191,69 @@ automatically, schedule `todo notify` with launchd.
   the meantime. Undoing the completion of a repeating task leaves its completed
   copy in place.
 
+## Using it as a library
+
+The package is a library with the `todo` program built on top. Another Rust
+project can use the library directly:
+
+```toml
+[dependencies]
+# Without the default `cli` feature you get only the library, without
+# clap, ratatui and comfy-table.
+todo = { path = "../to-do-cli", default-features = false }
+```
+
+```rust
+use todo::{Filter, MemoryList, Priority, Store, Task};
+
+// Store::open(path, "Todo") uses the real Reminders app instead.
+let mut store = Store::in_memory(MemoryList::new("Todo"))?;
+let task = store.add(&Task { priority: Priority::High, ..Task::new("Write report") })?;
+store.set_done(task.id, true)?;
+let open = store.list(&Filter { pending_only: true, ..Filter::default() })?;
+```
+
+Run `cargo doc --open` for the full API documentation.
+
 ## Development
 
 ```sh
 cargo build
-cargo test                 # unit tests, against an in-memory fake Reminders list
-cargo test -- --ignored    # integration tests against the real Reminders app
+cargo test                          # all tests, against an in-memory reminders list
+cargo test --no-default-features    # only the library
+cargo test -- --ignored             # integration tests against the real Reminders app
 cargo clippy --all-targets
 ```
 
 The integration tests create temporary lists named `todo-cli-test-…` (they
 sync to iCloud briefly) and delete them afterwards. They need Reminders access.
 
-| File | Contents |
-|---|---|
-| [src/main.rs](src/main.rs) | Command-line options and running each command |
-| [src/task.rs](src/task.rs) | The `Task` type, priorities, repeat rules, and date parsing |
-| [src/store.rs](src/store.rs) | Short IDs, undo history, filtering and sorting, and tag ↔ notes conversion |
-| [src/reminders.rs](src/reminders.rs) | All EventKit code (the only `unsafe` code) behind the `Backend` trait |
-| [src/display.rs](src/display.rs) | The colored table and the `show` output |
-| [src/tui.rs](src/tui.rs) | The terminal UI |
-| [src/notify.rs](src/notify.rs) | The "due tomorrow" notification |
-| [src/testing.rs](src/testing.rs) | In-memory fake Reminders list used by the tests |
+### Project layout
+
+```
+src/
+├── lib.rs                 library entry point and public API
+├── model/                 data types, no storage
+│   ├── task.rs            Task, DueStatus
+│   ├── priority.rs        Priority
+│   ├── repeat.rs          Repeat, RepeatUnit, parse_repeat
+│   └── dates.rs           today, parse_due
+├── reminders/             where tasks are kept
+│   ├── mod.rs             the Backend trait, Reminder, ReminderData
+│   ├── eventkit.rs        RemindersList: the Reminders app (all `unsafe` code)
+│   └── memory.rs          MemoryList: in memory, for tests
+├── store/                 the Store on top of a Backend
+│   ├── mod.rs             short IDs, undo history (SQLite)
+│   ├── filter.rs          Filter, SortKey
+│   └── convert.rs         Task ↔ reminder conversion, tags as hashtags
+└── bin/todo/              the command-line program (needs the `cli` feature)
+    ├── main.rs            entry point
+    ├── cli.rs             command-line options and running each command
+    ├── display.rs         the colored table and `show` output
+    ├── notify.rs          the "due tomorrow" notification
+    └── tui/
+        ├── mod.rs         the terminal UI
+        └── form.rs        the add/edit form
+tests/
+└── library.rs             uses the library through its public API only
+```

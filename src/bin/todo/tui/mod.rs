@@ -1,16 +1,19 @@
+//! The interactive terminal UI (`todo tui`).
+
+mod form;
+
 use anyhow::Result;
 use chrono::NaiveDate;
-use clap::ValueEnum;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
+use todo::model::{self, DueStatus, Priority, Task};
+use todo::{Backend, Filter, Store};
 
-use crate::reminders::Backend;
-use crate::store::{Filter, Store};
-use crate::task::{self, DueStatus, Priority, Repeat, Task};
+use form::{FIELDS, Form, FormValues};
 
 const HELP: &str =
     "a add · e edit · space done · d delete · u undo · / search · s sort · h hide done · q quit";
@@ -217,7 +220,7 @@ impl<'a, B: Backend> App<'a, B> {
         let [main, footer] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
 
-        let today = task::today();
+        let today = model::today();
         let header = Row::new(["ID", "", "Title", "Priority", "Due", "Tags"]).bold();
         let rows = self.tasks.iter().map(|t| task_row(t, today));
         let widths = [
@@ -287,235 +290,40 @@ fn task_row(task: &Task, today: NaiveDate) -> Row<'static> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Add / edit form
-// ---------------------------------------------------------------------------
-
-/// Label and input hint for each form field, in display order.
-const FIELDS: [(&str, &str); 5] = [
-    ("Title", "What needs to be done"),
-    ("Due", "YYYY-MM-DD, today, tomorrow or a weekday; empty for none"),
-    ("Priority", "low, medium or high; empty for none"),
-    ("Tags", "Comma separated, e.g. work, urgent"),
-    ("Repeat", "day, week, 2 weeks, monthly, ...; empty for none"),
-];
-
-struct Form {
-    /// `None` when adding a new task, otherwise the task being edited.
-    editing: Option<Task>,
-    /// The text in each field, in the same order as `FIELDS`.
-    fields: [String; 5],
-    /// Index of the field that receives typed keys.
-    focus: usize,
-    error: Option<String>,
-}
-
-/// The form's fields after checking and converting the typed text.
-struct FormValues {
-    title: String,
-    due: Option<NaiveDate>,
-    priority: Priority,
-    tags: Vec<String>,
-    repeat: Option<Repeat>,
-}
-
-impl Form {
-    fn new_task() -> Form {
-        Form {
-            editing: None,
-            fields: Default::default(),
-            focus: 0,
-            error: None,
-        }
-    }
-
-    fn edit(task: Task) -> Form {
-        Form {
-            fields: [
-                task.title.clone(),
-                task.due.map(|d| d.to_string()).unwrap_or_default(),
-                task.priority.label().to_string(),
-                task.tags.join(", "),
-                task.repeat.map(|r| r.label()).unwrap_or_default(),
-            ],
-            editing: Some(task),
-            focus: 0,
-            error: None,
-        }
-    }
-
-    fn parse(&self) -> Result<FormValues, String> {
-        let [title, due, priority, tags, repeat] = &self.fields;
-
-        let title = title.trim();
-        if title.is_empty() {
-            return Err("Title can't be empty".to_string());
-        }
-        let due = match due.trim() {
-            "" => None,
-            text => Some(task::parse_due(text)?),
-        };
-        let priority = match priority.trim() {
-            "" => Priority::None,
-            text => Priority::from_str(text, true)
-                .map_err(|_| "Priority must be none, low, medium or high".to_string())?,
-        };
-        let tags = tags
-            .split(',')
-            .map(str::trim)
-            .filter(|tag| !tag.is_empty())
-            .map(String::from)
-            .collect();
-        let repeat = match repeat.trim() {
-            "" => None,
-            text => Some(task::parse_repeat(text)?),
-        };
-
-        Ok(FormValues { title: title.to_string(), due, priority, tags, repeat })
-    }
-
-    fn draw(&self, frame: &mut Frame) {
-        let heading = if self.editing.is_some() { " Edit task " } else { " New task " };
-        // 5 fields + blank line + hint + keys, plus 2 for the border.
-        let area = centered(frame.area(), 70, 10);
-
-        let mut lines: Vec<Line> = FIELDS
-            .iter()
-            .zip(&self.fields)
-            .enumerate()
-            .map(|(i, ((label, _), value))| {
-                let focused = i == self.focus;
-                let marker = if focused { "› " } else { "  " };
-                let label = Span::from(format!("{marker}{label:<9}")).bold();
-                let cursor = if focused { "█" } else { "" };
-                Line::from(vec![label, Span::from(format!("{value}{cursor}"))])
-            })
-            .collect();
-
-        lines.push(Line::default());
-        lines.push(match &self.error {
-            Some(error) => Line::from(error.as_str()).red(),
-            None => Line::from(FIELDS[self.focus].1).dim(),
-        });
-        lines.push(Line::from("Tab/↑↓ switch field · Enter save · Esc cancel").dim());
-
-        // `Clear` blanks the table underneath so the form doesn't mix with it.
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(heading)),
-            area,
-        );
-    }
-}
-
-/// A rectangle of at most `width` x `height`, centered in `area`.
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let [area] = Layout::horizontal([Constraint::Length(width)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [area] = Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .areas(area);
-    area
-}
-
 #[cfg(test)]
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::task::RepeatUnit;
-    use crate::testing::{self, FakeList};
+    use todo::MemoryList;
 
-    fn press(app: &mut App<FakeList>, code: KeyCode) {
+    fn press(app: &mut App<MemoryList>, code: KeyCode) {
         app.handle_key(code).unwrap();
     }
 
-    fn type_text(app: &mut App<FakeList>, text: &str) {
+    fn type_text(app: &mut App<MemoryList>, text: &str) {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
         }
     }
 
-    fn titles(app: &App<FakeList>) -> Vec<String> {
+    fn titles(app: &App<MemoryList>) -> Vec<String> {
         app.tasks.iter().map(|t| t.title.clone()).collect()
     }
 
     /// Everything on screen as one string, row after row.
-    fn screen(app: &mut App<FakeList>) -> String {
+    fn screen(app: &mut App<MemoryList>) -> String {
         let mut terminal = Terminal::new(TestBackend::new(110, 20)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
-    }
-
-    fn form(fields: [&str; 5]) -> Form {
-        Form { fields: fields.map(String::from), ..Form::new_task() }
-    }
-
-    // --- Form ---------------------------------------------------------------
-
-    #[test]
-    fn new_form_is_empty() {
-        let form = Form::new_task();
-        assert!(form.editing.is_none() && form.error.is_none());
-        assert!(form.fields.iter().all(String::is_empty));
-        assert_eq!(form.focus, 0);
-    }
-
-    #[test]
-    fn edit_form_is_filled_from_the_task() {
-        let task = Task {
-            due: Some("2026-10-20".parse().unwrap()),
-            priority: Priority::High,
-            tags: vec!["a".into(), "b".into()],
-            repeat: Some(Repeat { unit: RepeatUnit::Week, interval: 2 }),
-            ..Task::new("Title")
-        };
-        let form = Form::edit(task);
-        assert_eq!(form.fields, ["Title", "2026-10-20", "high", "a, b", "every 2 weeks"]);
-        assert!(form.editing.is_some());
-    }
-
-    #[test]
-    fn form_parses_valid_input() {
-        let values = form([" Milk ", "2026-10-20", "HIGH", "home, , shop ", "2 weeks"]).parse().unwrap();
-        assert_eq!(values.title, "Milk");
-        assert_eq!(values.due, Some("2026-10-20".parse().unwrap()));
-        assert_eq!(values.priority, Priority::High);
-        assert_eq!(values.tags, ["home", "shop"]);
-        assert_eq!(values.repeat, Some(Repeat { unit: RepeatUnit::Week, interval: 2 }));
-    }
-
-    #[test]
-    fn form_treats_empty_optional_fields_as_unset() {
-        let values = form(["Milk", "", "", "", ""]).parse().unwrap();
-        assert_eq!((values.due, values.priority, values.repeat), (None, Priority::None, None));
-        assert!(values.tags.is_empty());
-    }
-
-    #[test]
-    fn form_explains_invalid_input() {
-        assert_eq!(form(["  ", "", "", "", ""]).parse().err().unwrap(), "Title can't be empty");
-        assert!(form(["a", "someday", "", "", ""]).parse().err().unwrap().contains("YYYY-MM-DD"));
-        assert_eq!(
-            form(["a", "", "urgent", "", ""]).parse().err().unwrap(),
-            "Priority must be none, low, medium or high"
-        );
-        assert!(form(["a", "", "", "", "fortnight"]).parse().err().unwrap().contains("2 weeks"));
-    }
-
-    #[test]
-    fn centered_fits_inside_the_area() {
-        assert_eq!(centered(Rect::new(0, 0, 100, 40), 70, 10), Rect::new(15, 15, 70, 10));
-        assert_eq!(centered(Rect::new(0, 0, 50, 5), 70, 10), Rect::new(0, 0, 50, 5));
     }
 
     // --- App ----------------------------------------------------------------
 
     #[test]
     fn adding_through_the_form_saves_every_field() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         let mut app = App::new(&mut db).unwrap();
         press(&mut app, KeyCode::Char('a'));
         type_text(&mut app, "Milk");
@@ -539,7 +347,7 @@ mod tests {
 
     #[test]
     fn form_keys_move_focus_and_edit_text() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         let mut app = App::new(&mut db).unwrap();
         press(&mut app, KeyCode::Char('a'));
         type_text(&mut app, "Mikl");
@@ -556,7 +364,7 @@ mod tests {
 
     #[test]
     fn invalid_form_stays_open_with_an_error() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         let mut app = App::new(&mut db).unwrap();
         press(&mut app, KeyCode::Char('a'));
         press(&mut app, KeyCode::Enter);
@@ -567,7 +375,7 @@ mod tests {
 
     #[test]
     fn escape_cancels_the_form() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         let mut app = App::new(&mut db).unwrap();
         press(&mut app, KeyCode::Char('a'));
         type_text(&mut app, "Never mind");
@@ -578,7 +386,7 @@ mod tests {
 
     #[test]
     fn editing_changes_the_selected_task() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         db.add(&Task { notes: "keep".into(), ..Task::new("Old") }).unwrap();
         let mut app = App::new(&mut db).unwrap();
         press(&mut app, KeyCode::Char('e'));
@@ -591,7 +399,7 @@ mod tests {
 
     #[test]
     fn space_toggles_done() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         db.add(&Task::new("a")).unwrap();
         let mut app = App::new(&mut db).unwrap();
         press(&mut app, KeyCode::Char(' '));
@@ -602,7 +410,7 @@ mod tests {
 
     #[test]
     fn delete_then_undo() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         db.add(&Task::new("a")).unwrap();
         let mut app = App::new(&mut db).unwrap();
         press(&mut app, KeyCode::Char('d'));
@@ -615,7 +423,7 @@ mod tests {
 
     #[test]
     fn undo_with_nothing_to_undo_says_so() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         let mut app = App::new(&mut db).unwrap();
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(app.message.as_deref(), Some("Nothing to undo"));
@@ -623,7 +431,7 @@ mod tests {
 
     #[test]
     fn arrow_keys_and_j_k_move_the_selection() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         for title in ["a", "b", "c"] {
             db.add(&Task::new(title)).unwrap();
         }
@@ -639,7 +447,7 @@ mod tests {
 
     #[test]
     fn search_filters_while_typing() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         for title in ["Buy milk", "Call mom", "Milk the cow"] {
             db.add(&Task::new(title)).unwrap();
         }
@@ -662,7 +470,7 @@ mod tests {
 
     #[test]
     fn s_cycles_sorting_and_h_hides_done() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         db.add(&Task { priority: Priority::Low, ..Task::new("low") }).unwrap();
         db.add(&Task { priority: Priority::High, ..Task::new("high") }).unwrap();
         let done = db.add(&Task::new("finished")).unwrap();
@@ -671,7 +479,7 @@ mod tests {
 
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Char('s'));
-        assert_eq!(app.filter.sort, crate::store::SortKey::Priority);
+        assert_eq!(app.filter.sort, todo::SortKey::Priority);
         assert_eq!(titles(&app), ["high", "low", "finished"]);
 
         press(&mut app, KeyCode::Char('h'));
@@ -683,7 +491,7 @@ mod tests {
     #[test]
     fn q_and_escape_quit() {
         for key in [KeyCode::Char('q'), KeyCode::Esc] {
-            let mut db = testing::store();
+            let mut db = crate::test_store();
             let mut app = App::new(&mut db).unwrap();
             press(&mut app, key);
             assert!(app.quit);
@@ -692,7 +500,7 @@ mod tests {
 
     #[test]
     fn screen_shows_list_tasks_and_help() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         let task = db.add(&Task { tags: vec!["work".into()], ..Task::new("Write report") }).unwrap();
         db.set_done(task.id, true).unwrap();
         let mut app = App::new(&mut db).unwrap();
@@ -704,7 +512,7 @@ mod tests {
 
     #[test]
     fn screen_shows_search_and_form() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         let mut app = App::new(&mut db).unwrap();
         press(&mut app, KeyCode::Char('/'));
         type_text(&mut app, "abc");

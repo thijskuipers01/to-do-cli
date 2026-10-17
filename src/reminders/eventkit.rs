@@ -1,6 +1,6 @@
 //! A thin wrapper around EventKit, Apple's framework behind the Reminders app.
 //! All the `unsafe` code for talking to Objective-C lives in this file; the
-//! rest of the program only sees the plain Rust types below.
+//! rest of the crate only sees the plain Rust types in `reminders`.
 
 use std::sync::mpsc;
 
@@ -15,46 +15,8 @@ use objc2_event_kit::{
 };
 use objc2_foundation::{NSArray, NSDateComponents, NSError, NSString};
 
-use crate::task::{Repeat, RepeatUnit};
-
-/// The fields of a reminder that this program reads and writes.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReminderData {
-    pub title: String,
-    pub notes: String,
-    pub done: bool,
-    pub due: Option<NaiveDate>,
-    /// EventKit's scale: 0 = none, 1–4 = high, 5 = medium, 6–9 = low.
-    pub priority: usize,
-    pub repeat: Option<Repeat>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Reminder {
-    /// EventKit's identifier, e.g. "3A365278-64BD-44F4-8DF6-F1C075B03AB1".
-    pub id: String,
-    /// Creation time (seconds since 1970), used to number reminders in a stable order.
-    pub created: f64,
-    /// Name of the list the reminder is in.
-    pub list: String,
-    pub data: ReminderData,
-}
-
-/// What the rest of the program needs from a reminders list. `RemindersList`
-/// is the real one; the tests use an in-memory fake instead.
-pub trait Backend {
-    /// Name of the list.
-    fn name(&self) -> String;
-    /// All reminders in the list, completed ones included.
-    fn all(&self) -> Result<Vec<Reminder>>;
-    fn get(&self, id: &str) -> Option<Reminder>;
-    /// Creates a reminder and returns its identifier. It goes in the list
-    /// called `list`, or in this list when `list` is `None`.
-    fn create(&self, data: &ReminderData, list: Option<&str>) -> Result<String>;
-    fn update(&self, id: &str, data: &ReminderData) -> Result<()>;
-    /// Deletes a reminder. Does nothing if it's already gone.
-    fn delete(&self, id: &str) -> Result<()>;
-}
+use super::{Backend, Reminder, ReminderData};
+use crate::model::{Repeat, RepeatUnit};
 
 /// One list in the Reminders app.
 pub struct RemindersList {

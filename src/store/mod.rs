@@ -1,17 +1,22 @@
-use std::cmp::Reverse;
+//! The [`Store`]: tasks kept in a reminders list, plus short IDs and an undo
+//! history in a small local SQLite database.
+
+mod convert;
+mod filter;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
-use clap::ValueEnum;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::reminders::{Backend, ReminderData, RemindersList};
-use crate::task::{self, Priority, Task};
+use crate::model::Task;
+use crate::reminders::{Backend, RemindersList};
+use convert::{to_data, to_task};
+pub use filter::{Filter, SortKey};
 
-/// Tasks themselves live in the Reminders app. This local database only
+/// Tasks themselves live in the reminders list. This local database only
 /// keeps what Reminders can't: short IDs and the undo history.
 const SCHEMA: &str = "
 -- Reminders identifies items by long strings like '3A365278-64BD-...'.
@@ -32,82 +37,16 @@ CREATE TABLE IF NOT EXISTS history (
 );
 ";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
-pub enum SortKey {
-    #[default]
-    Id,
-    Due,
-    Priority,
-}
-
-impl SortKey {
-    fn sort(self, tasks: &mut [Task]) {
-        // `(due.is_none(), due)` puts tasks without a due date last.
-        match self {
-            SortKey::Id => tasks.sort_by_key(|t| t.id),
-            SortKey::Due => {
-                tasks.sort_by_key(|t| (t.due.is_none(), t.due, Reverse(t.priority), t.id))
-            }
-            SortKey::Priority => {
-                tasks.sort_by_key(|t| (Reverse(t.priority), t.due.is_none(), t.due, t.id))
-            }
-        }
-    }
-
-    /// The next sort key, for cycling through them in the TUI.
-    pub fn next(self) -> SortKey {
-        match self {
-            SortKey::Id => SortKey::Due,
-            SortKey::Due => SortKey::Priority,
-            SortKey::Priority => SortKey::Id,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            SortKey::Id => "id",
-            SortKey::Due => "due date",
-            SortKey::Priority => "priority",
-        }
-    }
-}
-
-/// Which tasks `Store::list` returns, and in what order.
-#[derive(Debug, Default)]
-pub struct Filter {
-    pub tag: Option<String>,
-    pub priority: Option<Priority>,
-    pub pending_only: bool,
-    /// Text that must appear in the title or notes (upper/lower case ignored).
-    pub search: Option<String>,
-    /// Only tasks due on or before this date.
-    pub due_by: Option<NaiveDate>,
-    pub sort: SortKey,
-}
-
-impl Filter {
-    fn matches(&self, task: &Task) -> bool {
-        self.tag.as_ref().is_none_or(|tag| task.tags.contains(tag))
-            && self.priority.is_none_or(|priority| task.priority == priority)
-            && !(self.pending_only && task.done)
-            && self.search.as_ref().is_none_or(|text| {
-                let text = text.to_lowercase();
-                task.title.to_lowercase().contains(&text)
-                    || task.notes.to_lowercase().contains(&text)
-            })
-            && self.due_by.is_none_or(|by| task.due.is_some_and(|due| due <= by))
-    }
-}
-
 /// Tasks, stored in a reminders list `B`: the real Reminders app by default,
-/// or an in-memory fake in tests.
+/// or any other [`Backend`] such as [`MemoryList`](crate::MemoryList).
 pub struct Store<B = RemindersList> {
     conn: Connection,
     reminders: B,
 }
 
 impl Store {
-    /// Opens the local state database at `state_path` and the Reminders list `list_name`.
+    /// Opens the local state database at `state_path` and the Reminders list
+    /// `list_name`. The first time, macOS asks for access to Reminders.
     pub fn open(state_path: &Path, list_name: &str) -> Result<Store> {
         if let Some(dir) = state_path.parent() {
             fs::create_dir_all(dir)
@@ -126,17 +65,22 @@ impl<B: Backend> Store<B> {
         Ok(Store { conn, reminders })
     }
 
-    /// Name of the Reminders list this store works on.
+    /// A store whose state lives only in memory, e.g. for tests.
+    pub fn in_memory(reminders: B) -> Result<Store<B>> {
+        Store::with_backend(Connection::open_in_memory()?, reminders)
+    }
+
+    /// Name of the reminders list this store works on.
     pub fn list_name(&self) -> String {
         self.reminders.name()
     }
 
-    /// The underlying reminders list, so tests can inspect what was written.
-    #[cfg(test)]
+    /// The underlying reminders list.
     pub fn backend(&self) -> &B {
         &self.reminders
     }
 
+    /// The tasks in the list that match `filter`, in its sort order.
     pub fn list(&self, filter: &Filter) -> Result<Vec<Task>> {
         let mut reminders = self.reminders.all()?;
         // Reminders seen for the first time get the next free numbers, oldest first.
@@ -167,6 +111,7 @@ impl<B: Backend> Store<B> {
         Ok(tasks)
     }
 
+    /// The task with this ID, or `None` if there is none (anymore).
     pub fn get(&self, id: i64) -> Result<Option<Task>> {
         let Some(reminder_id) = self.reminder_id(id)? else {
             return Ok(None);
@@ -191,6 +136,7 @@ impl<B: Backend> Store<B> {
         self.get(task.id)?.context("the reminder disappeared")
     }
 
+    /// Marks a task as done or not done and returns it as it is now.
     pub fn set_done(&mut self, id: i64, done: bool) -> Result<Task> {
         let before = self.require(id)?;
         self.write(&Task { done, ..before.clone() })?;
@@ -200,6 +146,7 @@ impl<B: Backend> Store<B> {
         self.require(id)
     }
 
+    /// Deletes a task and returns it as it was.
     pub fn remove(&mut self, id: i64) -> Result<Task> {
         let before = self.require(id)?;
         if let Some(reminder_id) = self.reminder_id(id)? {
@@ -298,77 +245,17 @@ impl<B: Backend> Store<B> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Converting between tasks and reminders.
-//
-// EventKit can't read or write Reminders' own tags, so tags are stored as a
-// line of hashtags at the end of the reminder's notes: "#work #urgent".
-// Any other text in the notes is kept in `Task::notes` and left untouched.
-// ---------------------------------------------------------------------------
-
-fn to_task(id: i64, list: String, data: ReminderData) -> Task {
-    let (notes, tags) = split_notes(&data.notes);
-    Task {
-        id,
-        title: data.title,
-        done: data.done,
-        due: data.due,
-        priority: Priority::from_eventkit(data.priority),
-        tags,
-        notes,
-        repeat: data.repeat,
-        list,
-    }
-}
-
-fn to_data(task: &Task) -> ReminderData {
-    ReminderData {
-        title: task.title.clone(),
-        notes: join_notes(&task.notes, &task.tags),
-        done: task.done,
-        // A repeating reminder needs a date to repeat from; start today.
-        due: task.due.or(task.repeat.map(|_| task::today())),
-        priority: task.priority.to_eventkit(),
-        repeat: task.repeat,
-    }
-}
-
-/// Splits notes into the free text and the tags on its last line, if that
-/// line consists only of hashtags.
-fn split_notes(notes: &str) -> (String, Vec<String>) {
-    let (rest, last_line) = notes.rsplit_once('\n').unwrap_or(("", notes));
-    let words: Vec<&str> = last_line.split_whitespace().collect();
-    let all_hashtags = words.iter().all(|w| w.len() > 1 && w.starts_with('#'));
-    if words.is_empty() || !all_hashtags {
-        return (notes.to_string(), Vec::new());
-    }
-    let tags = words.iter().map(|w| w[1..].to_string()).collect();
-    (rest.to_string(), tags)
-}
-
-fn join_notes(rest: &str, tags: &[String]) -> String {
-    let mut hashtags: Vec<String> = Vec::new();
-    for tag in tags {
-        // A hashtag can't contain spaces, so "deep work" becomes "#deep-work".
-        let tag = tag.trim().trim_start_matches('#').split_whitespace().collect::<Vec<_>>();
-        let hashtag = format!("#{}", tag.join("-"));
-        if hashtag.len() > 1 && !hashtags.contains(&hashtag) {
-            hashtags.push(hashtag);
-        }
-    }
-    let line = hashtags.join(" ");
-    match (rest.is_empty(), line.is_empty()) {
-        (_, true) => rest.to_string(),
-        (true, false) => line,
-        (false, false) => format!("{rest}\n{line}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use chrono::NaiveDate;
+
     use super::*;
-    use crate::task::{Repeat, RepeatUnit};
-    use crate::testing::{self, data};
+    use crate::model::Priority;
+    use crate::reminders::{MemoryList, ReminderData};
+
+    fn store() -> Store<MemoryList> {
+        Store::in_memory(MemoryList::new("Todo")).unwrap()
+    }
 
     fn date(text: &str) -> NaiveDate {
         text.parse().unwrap()
@@ -386,170 +273,27 @@ mod tests {
         Filter::default()
     }
 
-    // --- Notes and tags -----------------------------------------------------
-
-    #[test]
-    fn split_notes_finds_the_hashtag_line() {
-        assert_eq!(split_notes(""), (String::new(), vec![]));
-        assert_eq!(split_notes("#work #urgent"), (String::new(), tags(&["work", "urgent"])));
-        assert_eq!(
-            split_notes("Ask for the blue one\n#shop"),
-            ("Ask for the blue one".to_string(), tags(&["shop"]))
-        );
-    }
-
-    #[test]
-    fn split_notes_leaves_ordinary_text_alone() {
-        for notes in ["Just text", "Call #2 tomorrow", "Line one\nline two", "#", "# heading"] {
-            assert_eq!(split_notes(notes), (notes.to_string(), vec![]), "notes {notes:?}");
-        }
-    }
-
-    #[test]
-    fn join_notes_cleans_and_deduplicates_tags() {
-        assert_eq!(join_notes("", &[]), "");
-        assert_eq!(join_notes("Text", &[]), "Text");
-        assert_eq!(join_notes("", &tags(&["work"])), "#work");
-        assert_eq!(join_notes("Text", &tags(&["a", "b"])), "Text\n#a #b");
-        assert_eq!(join_notes("", &tags(&["deep work", "#home", " ", "a", "a"])), "#deep-work #home #a");
-    }
-
-    #[test]
-    fn notes_and_tags_survive_a_round_trip() {
-        let notes = join_notes("Line one\nLine two", &tags(&["x", "y"]));
-        assert_eq!(split_notes(&notes), ("Line one\nLine two".to_string(), tags(&["x", "y"])));
-    }
-
-    // --- Converting between tasks and reminders -----------------------------
-
-    #[test]
-    fn task_and_reminder_data_convert_both_ways() {
-        let task = Task {
-            id: 3,
-            due: Some(date("2026-10-20")),
-            priority: Priority::High,
-            tags: tags(&["work"]),
-            notes: "Bring slides".into(),
-            repeat: Some(Repeat { unit: RepeatUnit::Week, interval: 1 }),
-            list: "Todo".into(),
-            ..Task::new("Weekly sync")
-        };
-        let data = to_data(&task);
-        assert_eq!(data.notes, "Bring slides\n#work");
-        assert_eq!(data.priority, 1);
-
-        let back = to_task(3, "Todo".into(), data);
-        assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&task).unwrap());
-    }
-
-    #[test]
-    fn repeating_task_without_due_date_starts_today() {
-        let task = Task { repeat: Some(Repeat { unit: RepeatUnit::Day, interval: 1 }), ..Task::new("a") };
-        assert_eq!(to_data(&task).due, Some(task::today()));
-        assert_eq!(to_data(&Task::new("a")).due, None);
-    }
-
-    // --- Filter and sorting -------------------------------------------------
-
-    fn sample_tasks() -> Vec<Task> {
-        vec![
-            Task { id: 1, due: Some(date("2026-10-20")), priority: Priority::Low, ..Task::new("Buy milk") },
-            Task { id: 2, priority: Priority::High, tags: tags(&["work"]), notes: "about the PLANTS".into(), ..Task::new("Email boss") },
-            Task { id: 3, due: Some(date("2026-10-18")), priority: Priority::Low, done: true, ..Task::new("Old thing") },
-            Task { id: 4, due: Some(date("2026-10-18")), priority: Priority::High, tags: tags(&["work", "home"]), ..Task::new("Water plants") },
-        ]
-    }
-
-    fn matching(filter: &Filter) -> Vec<i64> {
-        sample_tasks().iter().filter(|t| filter.matches(t)).map(|t| t.id).collect()
-    }
-
-    #[test]
-    fn empty_filter_matches_everything() {
-        assert_eq!(matching(&all()), [1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn filter_by_tag_priority_and_pending() {
-        assert_eq!(matching(&Filter { tag: Some("work".into()), ..all() }), [2, 4]);
-        assert_eq!(matching(&Filter { priority: Some(Priority::Low), ..all() }), [1, 3]);
-        assert_eq!(matching(&Filter { pending_only: true, ..all() }), [1, 2, 4]);
-    }
-
-    #[test]
-    fn search_looks_in_title_and_notes_ignoring_case() {
-        assert_eq!(matching(&Filter { search: Some("plant".into()), ..all() }), [2, 4]);
-        assert_eq!(matching(&Filter { search: Some("MILK".into()), ..all() }), [1]);
-        assert_eq!(matching(&Filter { search: Some("nothing".into()), ..all() }), Vec::<i64>::new());
-    }
-
-    #[test]
-    fn due_by_needs_a_due_date_on_or_before_the_day() {
-        assert_eq!(matching(&Filter { due_by: Some(date("2026-10-18")), ..all() }), [3, 4]);
-        assert_eq!(matching(&Filter { due_by: Some(date("2026-10-17")), ..all() }), Vec::<i64>::new());
-    }
-
-    #[test]
-    fn filters_combine() {
-        let filter = Filter { tag: Some("work".into()), search: Some("water".into()), ..all() };
-        assert_eq!(matching(&filter), [4]);
-    }
-
-    fn sorted(key: SortKey) -> Vec<i64> {
-        let mut tasks = sample_tasks();
-        tasks.reverse();
-        key.sort(&mut tasks);
-        tasks.iter().map(|t| t.id).collect()
-    }
-
-    #[test]
-    fn sort_by_id() {
-        assert_eq!(sorted(SortKey::Id), [1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn sort_by_due_puts_undated_last_and_breaks_ties_by_priority() {
-        assert_eq!(sorted(SortKey::Due), [4, 3, 1, 2]);
-    }
-
-    #[test]
-    fn sort_by_priority_then_due() {
-        assert_eq!(sorted(SortKey::Priority), [4, 2, 3, 1]);
-    }
-
-    #[test]
-    fn sort_keys_cycle_and_have_labels() {
-        assert_eq!(SortKey::Id.next(), SortKey::Due);
-        assert_eq!(SortKey::Due.next(), SortKey::Priority);
-        assert_eq!(SortKey::Priority.next(), SortKey::Id);
-        assert_eq!(SortKey::Id.label(), "id");
-        assert_eq!(SortKey::Due.label(), "due date");
-        assert_eq!(SortKey::Priority.label(), "priority");
-    }
-
-    // --- Store --------------------------------------------------------------
-
     #[test]
     fn list_name_comes_from_the_backend() {
-        assert_eq!(testing::store().list_name(), "Todo");
+        assert_eq!(store().list_name(), "Todo");
     }
 
     #[test]
     fn add_assigns_increasing_ids_and_writes_the_reminder() {
-        let mut db = testing::store();
+        let mut db = store();
         let first = db.add(&Task { tags: tags(&["work"]), ..Task::new("First") }).unwrap();
         let second = db.add(&Task::new("Second")).unwrap();
         assert_eq!((first.id, second.id), (1, 2));
         assert_eq!((first.list.as_str(), first.tags.clone()), ("Todo", tags(&["work"])));
-        assert_eq!(db.backend().data("fake-1").unwrap().notes, "#work");
+        assert_eq!(db.backend().data("memory-1").unwrap().notes, "#work");
     }
 
     #[test]
     fn reminders_made_elsewhere_get_numbers_oldest_first_and_keep_them() {
-        let mut db = testing::store();
-        db.backend().push(data("Made first on iPhone"), "Todo");
-        db.backend().push(data("Made second on iPhone"), "Todo");
-        db.backend().push(data("In another list"), "Shopping");
+        let mut db = store();
+        db.backend().push(ReminderData::new("Made first on iPhone"), "Todo");
+        db.backend().push(ReminderData::new("Made second on iPhone"), "Todo");
+        db.backend().push(ReminderData::new("In another list"), "Shopping");
 
         let tasks = db.list(&all()).unwrap();
         assert_eq!(titles(&tasks), ["Made first on iPhone", "Made second on iPhone"]);
@@ -563,7 +307,7 @@ mod tests {
 
     #[test]
     fn ids_are_never_reused() {
-        let mut db = testing::store();
+        let mut db = store();
         db.add(&Task::new("a")).unwrap();
         let b = db.add(&Task::new("b")).unwrap();
         db.remove(b.id).unwrap();
@@ -572,16 +316,16 @@ mod tests {
 
     #[test]
     fn get_returns_none_for_unknown_or_deleted_tasks() {
-        let mut db = testing::store();
+        let mut db = store();
         assert!(db.get(42).unwrap().is_none());
         let task = db.add(&Task::new("a")).unwrap();
-        db.backend().delete("fake-1").unwrap();
+        db.backend().delete("memory-1").unwrap();
         assert!(db.get(task.id).unwrap().is_none());
     }
 
     #[test]
     fn list_applies_filter_and_sort() {
-        let mut db = testing::store();
+        let mut db = store();
         db.add(&Task { due: Some(date("2026-10-20")), ..Task::new("Later") }).unwrap();
         db.add(&Task { due: Some(date("2026-10-18")), ..Task::new("Sooner") }).unwrap();
         db.add(&Task::new("Whenever")).unwrap();
@@ -591,9 +335,9 @@ mod tests {
 
     #[test]
     fn update_changes_fields_and_keeps_other_notes() {
-        let mut db = testing::store();
+        let mut db = store();
         let reminder_id = db.backend().push(
-            ReminderData { notes: "Ask for the blue one\n#shop".into(), ..data("Paint") },
+            ReminderData { notes: "Ask for the blue one\n#shop".into(), ..ReminderData::new("Paint") },
             "Todo",
         );
         let mut task = db.list(&all()).unwrap().remove(0);
@@ -610,7 +354,7 @@ mod tests {
 
     #[test]
     fn changing_a_missing_task_is_an_error() {
-        let mut db = testing::store();
+        let mut db = store();
         let error = |r: Result<Task>| r.unwrap_err().to_string();
         assert_eq!(error(db.set_done(9, true)), "no task with id 9");
         assert_eq!(error(db.remove(9)), "no task with id 9");
@@ -619,16 +363,16 @@ mod tests {
 
     #[test]
     fn set_done_marks_and_unmarks() {
-        let mut db = testing::store();
+        let mut db = store();
         let task = db.add(&Task::new("a")).unwrap();
         assert!(db.set_done(task.id, true).unwrap().done);
-        assert!(db.backend().data("fake-1").unwrap().done);
+        assert!(db.backend().data("memory-1").unwrap().done);
         assert!(!db.set_done(task.id, false).unwrap().done);
     }
 
     #[test]
     fn remove_deletes_the_reminder() {
-        let mut db = testing::store();
+        let mut db = store();
         let task = db.add(&Task::new("a")).unwrap();
         assert_eq!(db.remove(task.id).unwrap().title, "a");
         assert!(db.backend().ids().is_empty());
@@ -638,12 +382,12 @@ mod tests {
 
     #[test]
     fn undo_with_empty_history_does_nothing() {
-        assert_eq!(testing::store().undo().unwrap(), None);
+        assert_eq!(store().undo().unwrap(), None);
     }
 
     #[test]
     fn undo_add_deletes_the_task() {
-        let mut db = testing::store();
+        let mut db = store();
         let task = db.add(&Task::new("a")).unwrap();
         assert_eq!(db.undo().unwrap().as_deref(), Some("add of task 1"));
         assert!(db.get(task.id).unwrap().is_none());
@@ -652,7 +396,7 @@ mod tests {
 
     #[test]
     fn undo_edit_restores_every_field() {
-        let mut db = testing::store();
+        let mut db = store();
         let original = db.add(&Task { tags: tags(&["a"]), ..Task::new("Original") }).unwrap();
         db.update(&Task { title: "Changed".into(), tags: vec![], priority: Priority::High, ..original.clone() }).unwrap();
         assert_eq!(db.undo().unwrap().as_deref(), Some("edit of task 1"));
@@ -662,7 +406,7 @@ mod tests {
 
     #[test]
     fn undo_done_reopens_the_task() {
-        let mut db = testing::store();
+        let mut db = store();
         let task = db.add(&Task::new("a")).unwrap();
         db.set_done(task.id, true).unwrap();
         assert_eq!(db.undo().unwrap().as_deref(), Some("done of task 1"));
@@ -671,19 +415,19 @@ mod tests {
 
     #[test]
     fn undo_remove_recreates_the_task_under_the_same_id() {
-        let mut db = testing::store();
+        let mut db = store();
         let task = db.add(&Task { notes: "keep me".into(), ..Task::new("a") }).unwrap();
         db.remove(task.id).unwrap();
         assert_eq!(db.undo().unwrap().as_deref(), Some("remove of task 1"));
 
         let back = db.get(task.id).unwrap().unwrap();
         assert_eq!((back.title.as_str(), back.notes.as_str()), ("a", "keep me"));
-        assert_eq!(db.backend().ids(), ["fake-2"], "a new reminder was created");
+        assert_eq!(db.backend().ids(), ["memory-2"], "a new reminder was created");
     }
 
     #[test]
     fn undo_remove_puts_the_task_back_in_its_own_list() {
-        let mut db = testing::store();
+        let mut db = store();
         db.backend().switch_to("Shopping");
         let milk = db.add(&Task::new("Milk")).unwrap();
         db.remove(milk.id).unwrap();
@@ -696,10 +440,10 @@ mod tests {
 
     #[test]
     fn undo_recreates_a_task_deleted_on_another_device() {
-        let mut db = testing::store();
+        let mut db = store();
         let task = db.add(&Task::new("Original")).unwrap();
         db.update(&Task { title: "Edited".into(), ..task.clone() }).unwrap();
-        db.backend().delete("fake-1").unwrap();
+        db.backend().delete("memory-1").unwrap();
 
         db.undo().unwrap();
         assert_eq!(db.get(task.id).unwrap().unwrap().title, "Original");
@@ -707,7 +451,7 @@ mod tests {
 
     #[test]
     fn undo_steps_back_through_several_changes() {
-        let mut db = testing::store();
+        let mut db = store();
         let task = db.add(&Task::new("a")).unwrap();
         db.set_done(task.id, true).unwrap();
         db.remove(task.id).unwrap();

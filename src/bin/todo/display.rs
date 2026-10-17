@@ -4,7 +4,7 @@ use chrono::NaiveDate;
 use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 
-use crate::task::{self, DueStatus, Priority, Task};
+use todo::model::{self, DueStatus, Priority, Task};
 
 /// Prints tasks as a colored table. Colors are left out automatically when
 /// the output is not a terminal (e.g. when piped to a file).
@@ -12,13 +12,13 @@ pub fn print_tasks(tasks: &[Task]) {
     if tasks.is_empty() {
         println!("No tasks found. Add one with: todo add \"Buy milk\"");
     } else {
-        println!("{}", tasks_table(tasks, task::today()));
+        println!("{}", tasks_table(tasks, model::today()));
     }
 }
 
 /// Prints every detail of one task, including its notes.
 pub fn print_task_details(task: &Task) {
-    print!("{}", task_details(task, task::today()));
+    print!("{}", task_details(task, model::today()));
 }
 
 fn tasks_table(tasks: &[Task], today: NaiveDate) -> Table {
@@ -115,7 +115,7 @@ fn priority_color(priority: Priority) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::{Repeat, RepeatUnit};
+    use todo::{Repeat, RepeatUnit};
 
     fn date(text: &str) -> NaiveDate {
         text.parse().unwrap()

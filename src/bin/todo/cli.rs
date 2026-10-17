@@ -1,29 +1,22 @@
-mod display;
-mod notify;
-mod reminders;
-mod store;
-mod task;
-#[cfg(test)]
-mod testing;
-mod tui;
+//! The command-line options, and running each command.
 
 use std::env;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use todo::model::{self, Priority, Repeat, Task};
+use todo::{Backend, Filter, SortKey, Store};
 
-use reminders::Backend;
-use store::{Filter, SortKey, Store};
-use task::{Priority, Repeat, Task};
+use crate::{display, notify, tui};
 
 /// Where the local state (short IDs and undo history) lives: `$TODO_STATE` if
 /// set, otherwise `$XDG_DATA_HOME/todo/state.db`, which defaults to
 /// `~/.local/share/todo/state.db`.
-fn state_path() -> Result<PathBuf> {
+pub fn state_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("TODO_STATE") {
         return Ok(PathBuf::from(path));
     }
@@ -40,23 +33,23 @@ fn state_path() -> Result<PathBuf> {
 
 #[derive(Parser)]
 #[command(name = "todo", version, about = "A to-do manager backed by Apple Reminders")]
-struct Cli {
+pub struct Cli {
     /// Reminders list to use (created if it doesn't exist)
     #[arg(short, long, global = true, env = "TODO_LIST", default_value = "Todo")]
-    list: String,
+    pub list: String,
 
     #[command(subcommand)]
-    command: Command,
+    pub command: Command,
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub enum Command {
     /// Add a new task
     Add {
         /// The task description
         title: String,
         /// Due date: YYYY-MM-DD, "today", "tomorrow" or a weekday ("friday")
-        #[arg(short, long, value_parser = task::parse_due)]
+        #[arg(short, long, value_parser = model::parse_due)]
         due: Option<NaiveDate>,
         /// How urgent the task is
         #[arg(short, long, value_enum, default_value_t = Priority::None)]
@@ -65,7 +58,7 @@ enum Command {
         #[arg(short, long = "tag")]
         tags: Vec<String>,
         /// Repeat the task: "day", "week", "2 weeks", "monthly", ... (starts today without --due)
-        #[arg(short, long, value_parser = task::parse_repeat)]
+        #[arg(short, long, value_parser = model::parse_repeat)]
         every: Option<Repeat>,
     },
     /// Change the title, due date, priority, tags or repeat of a task
@@ -76,7 +69,7 @@ enum Command {
         #[arg(long)]
         title: Option<String>,
         /// New due date (same formats as `add`)
-        #[arg(short, long, value_parser = task::parse_due, conflicts_with = "no_due")]
+        #[arg(short, long, value_parser = model::parse_due, conflicts_with = "no_due")]
         due: Option<NaiveDate>,
         /// Remove the due date
         #[arg(long)]
@@ -91,7 +84,7 @@ enum Command {
         #[arg(long = "untag")]
         untags: Vec<String>,
         /// New repeat interval (same formats as `add`)
-        #[arg(short, long, value_parser = task::parse_repeat, conflicts_with = "no_repeat")]
+        #[arg(short, long, value_parser = model::parse_repeat, conflicts_with = "no_repeat")]
         every: Option<Repeat>,
         /// Stop repeating the task
         #[arg(long)]
@@ -148,26 +141,13 @@ enum Command {
 // Main
 // ---------------------------------------------------------------------------
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // Completions don't need Reminders, so handle them before asking for access.
-    if let Command::Completions { shell } = cli.command {
-        print_completions(shell, &mut io::stdout());
-        return Ok(());
-    }
-
-    let mut db = Store::open(&state_path()?, &cli.list)?;
-    run(cli.command, &mut db)
-}
-
-fn print_completions(shell: Shell, out: &mut impl Write) {
+pub fn print_completions(shell: Shell, out: &mut impl Write) {
     clap_complete::generate(shell, &mut Cli::command(), "todo", out);
 }
 
 /// Runs one command. Generic over the reminders list so the tests can run
-/// commands against an in-memory fake instead of the real Reminders app.
-fn run<B: Backend>(command: Command, db: &mut Store<B>) -> Result<()> {
+/// commands against an in-memory list instead of the real Reminders app.
+pub fn run<B: Backend>(command: Command, db: &mut Store<B>) -> Result<()> {
     match command {
         Command::Add { title, due, priority, tags, every } => {
             let task = db.add(&Task { due, priority, tags, repeat: every, ..Task::new(&title) })?;
@@ -216,7 +196,7 @@ fn run<B: Backend>(command: Command, db: &mut Store<B>) -> Result<()> {
         Command::Today => {
             let filter = Filter {
                 pending_only: true,
-                due_by: Some(task::today()),
+                due_by: Some(model::today()),
                 sort: SortKey::Due,
                 ..Filter::default()
             };
@@ -259,8 +239,7 @@ fn run<B: Backend>(command: Command, db: &mut Store<B>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::RepeatUnit;
-    use crate::testing;
+    use todo::RepeatUnit;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("todo").chain(args.iter().copied()))
@@ -360,7 +339,7 @@ mod tests {
 
     #[test]
     fn every_command_runs() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         let commands = [
             vec!["add", "Milk", "-d", "today", "-t", "shop"],
             vec!["add", "Plants", "--every", "week"],
@@ -384,7 +363,7 @@ mod tests {
 
     #[test]
     fn edit_applies_only_the_given_changes() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         run(command(&["add", "Milk", "-d", "2026-10-20", "-p", "high", "--every", "week"]), &mut db).unwrap();
         run(command(&["edit", "1", "--no-due", "--no-repeat"]), &mut db).unwrap();
         let task = db.get(1).unwrap().unwrap();
@@ -398,7 +377,7 @@ mod tests {
 
     #[test]
     fn commands_report_problems() {
-        let mut db = testing::store();
+        let mut db = crate::test_store();
         let error = |db: &mut Store<_>, args: &[&str]| run(command(args), db).unwrap_err().to_string();
         assert!(error(&mut db, &["edit", "1"]).starts_with("nothing to change"));
         assert_eq!(error(&mut db, &["edit", "1", "-p", "low"]), "no task with id 1");
