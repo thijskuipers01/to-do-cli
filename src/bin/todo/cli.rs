@@ -38,6 +38,10 @@ pub struct Cli {
     #[arg(short, long, global = true, env = "TODO_LIST", default_value = "Todo")]
     pub list: String,
 
+    /// Print JSON instead of text, for scripts and AI assistants
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -147,11 +151,17 @@ pub fn print_completions(shell: Shell, out: &mut impl Write) {
 
 /// Runs one command. Generic over the reminders list so the tests can run
 /// commands against an in-memory list instead of the real Reminders app.
-pub fn run<B: Backend>(command: Command, db: &mut Store<B>) -> Result<()> {
+/// With `json`, commands print JSON: the tasks for `list`, `today` and `show`,
+/// and the changed task for `add`, `edit`, `done` and `remove`.
+pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Result<()> {
     match command {
         Command::Add { title, due, priority, tags, every } => {
             let task = db.add(&Task { due, priority, tags, repeat: every, ..Task::new(&title) })?;
-            println!("Added task {}: {}", task.id, task.title);
+            if json {
+                display::print_task_json(&task)?;
+            } else {
+                println!("Added task {}: {}", task.id, task.title);
+            }
         }
         Command::Edit { id, title, due, no_due, priority, tags, untags, every, no_repeat } => {
             if title.is_none()
@@ -187,11 +197,20 @@ pub fn run<B: Backend>(command: Command, db: &mut Store<B>) -> Result<()> {
             }
 
             let task = db.update(&task)?;
-            println!("Updated task {id}: {}", task.title);
+            if json {
+                display::print_task_json(&task)?;
+            } else {
+                println!("Updated task {id}: {}", task.title);
+            }
         }
         Command::List { tag, priority, search, pending, sort } => {
             let filter = Filter { tag, priority, search, pending_only: pending, sort, ..Filter::default() };
-            display::print_tasks(&db.list(&filter)?);
+            let tasks = db.list(&filter)?;
+            if json {
+                display::print_tasks_json(&tasks)?;
+            } else {
+                display::print_tasks(&tasks);
+            }
         }
         Command::Today => {
             let filter = Filter {
@@ -201,7 +220,9 @@ pub fn run<B: Backend>(command: Command, db: &mut Store<B>) -> Result<()> {
                 ..Filter::default()
             };
             let tasks = db.list(&filter)?;
-            if tasks.is_empty() {
+            if json {
+                display::print_tasks_json(&tasks)?;
+            } else if tasks.is_empty() {
                 println!("Nothing overdue or due today.");
             } else {
                 display::print_tasks(&tasks);
@@ -209,10 +230,18 @@ pub fn run<B: Backend>(command: Command, db: &mut Store<B>) -> Result<()> {
         }
         Command::Show { id } => {
             let task = db.get(id)?.with_context(|| format!("no task with id {id}"))?;
-            display::print_task_details(&task);
+            if json {
+                display::print_task_json(&task)?;
+            } else {
+                display::print_task_details(&task);
+            }
         }
         Command::Done { id } => {
             let task = db.set_done(id, true)?;
+            if json {
+                display::print_task_json(&task)?;
+                return Ok(());
+            }
             match (task.done, task.due) {
                 (false, Some(next)) => {
                     println!("Completed task {id}: {} (repeats, next due {next})", task.title)
@@ -222,11 +251,16 @@ pub fn run<B: Backend>(command: Command, db: &mut Store<B>) -> Result<()> {
         }
         Command::Remove { id } => {
             let task = db.remove(id)?;
-            println!("Removed task {id}: {}", task.title);
+            if json {
+                display::print_task_json(&task)?;
+            } else {
+                println!("Removed task {id}: {}", task.title);
+            }
         }
-        Command::Undo => match db.undo()? {
-            Some(what) => println!("Undid {what}"),
-            None => println!("Nothing to undo"),
+        Command::Undo => match (db.undo()?, json) {
+            (what, true) => println!("{}", serde_json::json!({ "undone": what })),
+            (Some(what), false) => println!("Undid {what}"),
+            (None, false) => println!("Nothing to undo"),
         },
         Command::Tui => tui::run(db)?,
         Command::Notify => notify::due_tomorrow(db)?,
@@ -354,7 +388,7 @@ mod tests {
             vec!["undo"],
         ];
         for args in commands {
-            run(command(&args), &mut db).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
+            run(command(&args), false, &mut db).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
         }
         let milk = db.get(1).unwrap().unwrap();
         assert_eq!((milk.title.as_str(), milk.priority, milk.done), ("Oat milk", Priority::Low, true));
@@ -362,14 +396,37 @@ mod tests {
     }
 
     #[test]
+    fn every_command_runs_with_json() {
+        let mut db = crate::test_store();
+        for args in [
+            vec!["add", "Milk", "--json"],
+            vec!["--json", "list"],
+            vec!["today", "--json"],
+            vec!["show", "1", "--json"],
+            vec!["edit", "1", "-p", "high", "--json"],
+            vec!["done", "1", "--json"],
+            vec!["remove", "1", "--json"],
+            vec!["undo", "--json"],
+            vec!["undo", "--json"],
+        ] {
+            let cli = parse(&args).unwrap();
+            assert!(cli.json, "{args:?} should set --json");
+            run(cli.command, cli.json, &mut db).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
+        }
+        // The two undos bring back the removed task, then reopen it.
+        let task = db.get(1).unwrap().unwrap();
+        assert_eq!((task.done, task.priority), (false, Priority::High));
+    }
+
+    #[test]
     fn edit_applies_only_the_given_changes() {
         let mut db = crate::test_store();
-        run(command(&["add", "Milk", "-d", "2026-10-20", "-p", "high", "--every", "week"]), &mut db).unwrap();
-        run(command(&["edit", "1", "--no-due", "--no-repeat"]), &mut db).unwrap();
+        run(command(&["add", "Milk", "-d", "2026-10-20", "-p", "high", "--every", "week"]), false, &mut db).unwrap();
+        run(command(&["edit", "1", "--no-due", "--no-repeat"]), false, &mut db).unwrap();
         let task = db.get(1).unwrap().unwrap();
         assert_eq!((task.due, task.repeat, task.priority), (None, None, Priority::High));
 
-        run(command(&["edit", "1", "--every", "monthly", "-d", "2026-11-01"]), &mut db).unwrap();
+        run(command(&["edit", "1", "--every", "monthly", "-d", "2026-11-01"]), false, &mut db).unwrap();
         let task = db.get(1).unwrap().unwrap();
         assert_eq!(task.repeat, Some(Repeat { unit: RepeatUnit::Month, interval: 1 }));
         assert_eq!(task.due, Some("2026-11-01".parse().unwrap()));
@@ -378,12 +435,12 @@ mod tests {
     #[test]
     fn commands_report_problems() {
         let mut db = crate::test_store();
-        let error = |db: &mut Store<_>, args: &[&str]| run(command(args), db).unwrap_err().to_string();
+        let error = |db: &mut Store<_>, args: &[&str]| run(command(args), false, db).unwrap_err().to_string();
         assert!(error(&mut db, &["edit", "1"]).starts_with("nothing to change"));
         assert_eq!(error(&mut db, &["edit", "1", "-p", "low"]), "no task with id 1");
         assert_eq!(error(&mut db, &["show", "1"]), "no task with id 1");
         assert_eq!(error(&mut db, &["done", "1"]), "no task with id 1");
         assert_eq!(error(&mut db, &["remove", "1"]), "no task with id 1");
-        run(command(&["undo"]), &mut db).unwrap(); // nothing to undo is not an error
+        run(command(&["undo"]), false, &mut db).unwrap(); // nothing to undo is not an error
     }
 }

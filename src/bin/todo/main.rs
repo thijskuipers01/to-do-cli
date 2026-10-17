@@ -23,7 +23,7 @@ fn main() -> Result<()> {
     }
 
     let mut store = Store::open(&cli::state_path()?, &cli.list)?;
-    cli::run(cli.command, &mut store)
+    cli::run(cli.command, cli.json, &mut store)
 }
 
 /// A store backed by an empty in-memory list called "Todo", for the tests.
