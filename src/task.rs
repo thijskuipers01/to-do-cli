@@ -200,3 +200,164 @@ fn next_weekday(from: NaiveDate, weekday: Weekday) -> NaiveDate {
     let ahead = if ahead == 0 { 7 } else { ahead };
     from + Days::new(ahead.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn date(text: &str) -> NaiveDate {
+        text.parse().unwrap()
+    }
+
+    fn repeat(unit: RepeatUnit, interval: u32) -> Repeat {
+        Repeat { unit, interval }
+    }
+
+    // --- Priority ---------------------------------------------------------
+
+    #[test]
+    fn priority_from_eventkit_covers_the_whole_scale() {
+        assert_eq!(Priority::from_eventkit(0), Priority::None);
+        for value in 1..=4 {
+            assert_eq!(Priority::from_eventkit(value), Priority::High);
+        }
+        assert_eq!(Priority::from_eventkit(5), Priority::Medium);
+        for value in 6..=9 {
+            assert_eq!(Priority::from_eventkit(value), Priority::Low);
+        }
+    }
+
+    #[test]
+    fn priority_survives_a_round_trip_through_eventkit() {
+        for priority in [Priority::None, Priority::Low, Priority::Medium, Priority::High] {
+            assert_eq!(Priority::from_eventkit(priority.to_eventkit()), priority);
+        }
+    }
+
+    #[test]
+    fn priority_labels_and_order() {
+        assert_eq!(Priority::None.label(), "");
+        assert_eq!(Priority::Low.label(), "low");
+        assert_eq!(Priority::Medium.label(), "medium");
+        assert_eq!(Priority::High.label(), "high");
+        assert!(Priority::None < Priority::Low);
+        assert!(Priority::Low < Priority::Medium);
+        assert!(Priority::Medium < Priority::High);
+    }
+
+    // --- Repeat -----------------------------------------------------------
+
+    #[test]
+    fn repeat_labels() {
+        assert_eq!(repeat(RepeatUnit::Day, 1).label(), "every day");
+        assert_eq!(repeat(RepeatUnit::Week, 2).label(), "every 2 weeks");
+        assert_eq!(repeat(RepeatUnit::Month, 3).label(), "every 3 months");
+        assert_eq!(repeat(RepeatUnit::Year, 1).label(), "every year");
+    }
+
+    #[test]
+    fn parse_repeat_accepts_common_forms() {
+        let cases = [
+            ("week", repeat(RepeatUnit::Week, 1)),
+            ("every week", repeat(RepeatUnit::Week, 1)),
+            ("weekly", repeat(RepeatUnit::Week, 1)),
+            ("2 weeks", repeat(RepeatUnit::Week, 2)),
+            ("every 3 days", repeat(RepeatUnit::Day, 3)),
+            ("daily", repeat(RepeatUnit::Day, 1)),
+            ("Monthly", repeat(RepeatUnit::Month, 1)),
+            ("  every 1 year ", repeat(RepeatUnit::Year, 1)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_repeat(input), Ok(expected), "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_repeat_rejects_nonsense() {
+        for input in ["", "every", "fortnight", "0 weeks", "two weeks", "2 weeks please", "-1 day"] {
+            assert!(parse_repeat(input).is_err(), "should reject {input:?}");
+        }
+    }
+
+    #[test]
+    fn repeat_labels_parse_back_to_the_same_repeat() {
+        for r in [repeat(RepeatUnit::Day, 1), repeat(RepeatUnit::Week, 2), repeat(RepeatUnit::Year, 5)] {
+            assert_eq!(parse_repeat(&r.label()), Ok(r));
+        }
+    }
+
+    // --- Due dates ----------------------------------------------------------
+
+    #[test]
+    fn parse_due_accepts_dates_and_words() {
+        assert_eq!(parse_due("2026-12-31"), Ok(date("2026-12-31")));
+        assert_eq!(parse_due("today"), Ok(today()));
+        assert_eq!(parse_due(" Tomorrow "), Ok(today() + Days::new(1)));
+    }
+
+    #[test]
+    fn parse_due_weekdays_are_always_in_the_coming_week() {
+        for name in ["monday", "Fri", "sunday", "SAT"] {
+            let due = parse_due(name).unwrap();
+            let days_ahead = (due - today()).num_days();
+            assert!((1..=7).contains(&days_ahead), "{name} gave {due}");
+            assert_eq!(due.weekday(), name.parse::<Weekday>().unwrap());
+        }
+    }
+
+    #[test]
+    fn parse_due_rejects_invalid_dates() {
+        for input in ["", "2026-13-01", "2026-02-30", "31-12-2026", "someday"] {
+            assert!(parse_due(input).is_err(), "should reject {input:?}");
+        }
+    }
+
+    #[test]
+    fn next_weekday_skips_to_next_week_on_the_same_day() {
+        let saturday = date("2026-10-17");
+        assert_eq!(next_weekday(saturday, Weekday::Sat), date("2026-10-24"));
+        assert_eq!(next_weekday(saturday, Weekday::Sun), date("2026-10-18"));
+        assert_eq!(next_weekday(saturday, Weekday::Fri), date("2026-10-23"));
+        assert_eq!(next_weekday(saturday, Weekday::Mon), date("2026-10-19"));
+    }
+
+    // --- Task ---------------------------------------------------------------
+
+    #[test]
+    fn new_task_has_only_a_title() {
+        let task = Task::new("Buy milk");
+        assert_eq!(task.title, "Buy milk");
+        assert_eq!((task.id, task.done, task.due, task.repeat), (0, false, None, None));
+        assert_eq!(task.priority, Priority::None);
+        assert!(task.tags.is_empty() && task.notes.is_empty() && task.list.is_empty());
+    }
+
+    #[test]
+    fn due_label_marks_repeating_tasks() {
+        let due = Some(date("2026-10-20"));
+        assert_eq!(Task::new("a").due_label(), "");
+        assert_eq!(Task { due, ..Task::new("a") }.due_label(), "2026-10-20");
+        let repeating = Task { due, repeat: Some(repeat(RepeatUnit::Week, 1)), ..Task::new("a") };
+        assert_eq!(repeating.due_label(), "2026-10-20 ↻");
+    }
+
+    #[test]
+    fn due_status_compares_with_today() {
+        let today = date("2026-10-17");
+        let due = |d: &str| Task { due: Some(date(d)), ..Task::new("a") };
+        assert!(matches!(due("2026-10-16").due_status(today), Some(DueStatus::Overdue)));
+        assert!(matches!(due("2026-10-17").due_status(today), Some(DueStatus::Today)));
+        assert!(matches!(due("2026-10-18").due_status(today), Some(DueStatus::Upcoming)));
+        assert!(Task::new("a").due_status(today).is_none());
+        let done = Task { done: true, ..due("2026-10-16") };
+        assert!(done.due_status(today).is_none());
+    }
+
+    #[test]
+    fn old_undo_snapshots_without_new_fields_still_load() {
+        // Snapshots saved before `repeat` and `list` existed must still work.
+        let json = r#"{"id":1,"title":"Old","done":false,"due":null,"priority":"High","tags":[],"notes":""}"#;
+        let task: Task = serde_json::from_str(json).unwrap();
+        assert_eq!((task.repeat, task.list.as_str()), (None, ""));
+    }
+}

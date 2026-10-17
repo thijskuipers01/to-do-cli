@@ -3,10 +3,12 @@ mod notify;
 mod reminders;
 mod store;
 mod task;
+#[cfg(test)]
+mod testing;
 mod tui;
 
 use std::env;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +16,7 @@ use chrono::NaiveDate;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
+use reminders::Backend;
 use store::{Filter, SortKey, Store};
 use task::{Priority, Repeat, Task};
 
@@ -150,13 +153,22 @@ fn main() -> Result<()> {
 
     // Completions don't need Reminders, so handle them before asking for access.
     if let Command::Completions { shell } = cli.command {
-        clap_complete::generate(shell, &mut Cli::command(), "todo", &mut io::stdout());
+        print_completions(shell, &mut io::stdout());
         return Ok(());
     }
 
     let mut db = Store::open(&state_path()?, &cli.list)?;
+    run(cli.command, &mut db)
+}
 
-    match cli.command {
+fn print_completions(shell: Shell, out: &mut impl Write) {
+    clap_complete::generate(shell, &mut Cli::command(), "todo", out);
+}
+
+/// Runs one command. Generic over the reminders list so the tests can run
+/// commands against an in-memory fake instead of the real Reminders app.
+fn run<B: Backend>(command: Command, db: &mut Store<B>) -> Result<()> {
+    match command {
         Command::Add { title, due, priority, tags, every } => {
             let task = db.add(&Task { due, priority, tags, repeat: every, ..Task::new(&title) })?;
             println!("Added task {}: {}", task.id, task.title);
@@ -236,10 +248,163 @@ fn main() -> Result<()> {
             Some(what) => println!("Undid {what}"),
             None => println!("Nothing to undo"),
         },
-        Command::Tui => tui::run(&mut db)?,
-        Command::Notify => notify::due_tomorrow(&db)?,
+        Command::Tui => tui::run(db)?,
+        Command::Notify => notify::due_tomorrow(db)?,
         Command::Completions { .. } => unreachable!("handled above"),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::RepeatUnit;
+    use crate::testing;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("todo").chain(args.iter().copied()))
+    }
+
+    fn command(args: &[&str]) -> Command {
+        parse(args).unwrap().command
+    }
+
+    // --- Parsing the command line -------------------------------------------
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn add_with_every_option() {
+        let Command::Add { title, due, priority, tags, every } = command(&[
+            "add", "Milk", "-d", "2026-10-20", "-p", "high", "-t", "home", "-t", "shop", "--every", "2 weeks",
+        ]) else {
+            panic!("not an add command");
+        };
+        assert_eq!(title, "Milk");
+        assert_eq!(due, Some("2026-10-20".parse().unwrap()));
+        assert_eq!((priority, tags), (Priority::High, vec!["home".into(), "shop".into()]));
+        assert_eq!(every, Some(Repeat { unit: RepeatUnit::Week, interval: 2 }));
+    }
+
+    #[test]
+    fn add_defaults() {
+        let Command::Add { due, priority, tags, every, .. } = command(&["add", "Milk"]) else {
+            panic!("not an add command");
+        };
+        assert_eq!((due, priority, every), (None, Priority::None, None));
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn list_option_works_before_and_after_the_command() {
+        assert_eq!(parse(&["--list", "Shopping", "list"]).unwrap().list, "Shopping");
+        assert_eq!(parse(&["list", "-l", "Shopping"]).unwrap().list, "Shopping");
+    }
+
+    #[test]
+    fn list_filters() {
+        let Command::List { tag, priority, search, pending, sort } =
+            command(&["list", "-t", "work", "-p", "low", "--search", "mail", "--pending", "-s", "due"])
+        else {
+            panic!("not a list command");
+        };
+        assert_eq!(tag.as_deref(), Some("work"));
+        assert_eq!(priority, Some(Priority::Low));
+        assert_eq!(search.as_deref(), Some("mail"));
+        assert!(pending);
+        assert_eq!(sort, SortKey::Due);
+    }
+
+    #[test]
+    fn contradicting_or_invalid_options_are_rejected() {
+        for args in [
+            &["edit", "1", "--due", "today", "--no-due"][..],
+            &["edit", "1", "--every", "week", "--no-repeat"],
+            &["add", "x", "--due", "someday"],
+            &["add", "x", "--priority", "urgent"],
+            &["add", "x", "--every", "fortnight"],
+            &["done", "one"],
+            &["completions", "notashell"],
+        ] {
+            assert!(parse(args).is_err(), "should reject {args:?}");
+        }
+    }
+
+    #[test]
+    fn completion_scripts_cover_the_commands() {
+        for shell in [Shell::Zsh, Shell::Bash, Shell::Fish] {
+            let mut out = Vec::new();
+            print_completions(shell, &mut out);
+            let script = String::from_utf8(out).unwrap();
+            // Fish writes long options as `-l every`, so look for the bare name.
+            for word in ["todo", "add", "today", "completions", "every"] {
+                assert!(script.contains(word), "{shell}: missing {word:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn state_path_defaults_to_the_data_directory() {
+        let path = state_path().unwrap();
+        match env::var_os("TODO_STATE") {
+            Some(custom) => assert_eq!(path, PathBuf::from(custom)),
+            None => assert!(path.ends_with("todo/state.db"), "{}", path.display()),
+        }
+    }
+
+    // --- Running commands against the fake list ------------------------------
+
+    #[test]
+    fn every_command_runs() {
+        let mut db = testing::store();
+        let commands = [
+            vec!["add", "Milk", "-d", "today", "-t", "shop"],
+            vec!["add", "Plants", "--every", "week"],
+            vec!["list"],
+            vec!["list", "--search", "milk", "-s", "priority"],
+            vec!["today"],
+            vec!["show", "1"],
+            vec!["edit", "1", "--title", "Oat milk", "-p", "low", "--untag", "shop", "-t", "store"],
+            vec!["done", "1"],
+            vec!["done", "2"],
+            vec!["remove", "1"],
+            vec!["undo"],
+        ];
+        for args in commands {
+            run(command(&args), &mut db).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
+        }
+        let milk = db.get(1).unwrap().unwrap();
+        assert_eq!((milk.title.as_str(), milk.priority, milk.done), ("Oat milk", Priority::Low, true));
+        assert_eq!(milk.tags, ["store"]);
+    }
+
+    #[test]
+    fn edit_applies_only_the_given_changes() {
+        let mut db = testing::store();
+        run(command(&["add", "Milk", "-d", "2026-10-20", "-p", "high", "--every", "week"]), &mut db).unwrap();
+        run(command(&["edit", "1", "--no-due", "--no-repeat"]), &mut db).unwrap();
+        let task = db.get(1).unwrap().unwrap();
+        assert_eq!((task.due, task.repeat, task.priority), (None, None, Priority::High));
+
+        run(command(&["edit", "1", "--every", "monthly", "-d", "2026-11-01"]), &mut db).unwrap();
+        let task = db.get(1).unwrap().unwrap();
+        assert_eq!(task.repeat, Some(Repeat { unit: RepeatUnit::Month, interval: 1 }));
+        assert_eq!(task.due, Some("2026-11-01".parse().unwrap()));
+    }
+
+    #[test]
+    fn commands_report_problems() {
+        let mut db = testing::store();
+        let error = |db: &mut Store<_>, args: &[&str]| run(command(args), db).unwrap_err().to_string();
+        assert!(error(&mut db, &["edit", "1"]).starts_with("nothing to change"));
+        assert_eq!(error(&mut db, &["edit", "1", "-p", "low"]), "no task with id 1");
+        assert_eq!(error(&mut db, &["show", "1"]), "no task with id 1");
+        assert_eq!(error(&mut db, &["done", "1"]), "no task with id 1");
+        assert_eq!(error(&mut db, &["remove", "1"]), "no task with id 1");
+        run(command(&["undo"]), &mut db).unwrap(); // nothing to undo is not an error
+    }
 }

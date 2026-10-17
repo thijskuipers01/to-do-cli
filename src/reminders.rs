@@ -18,6 +18,7 @@ use objc2_foundation::{NSArray, NSDateComponents, NSError, NSString};
 use crate::task::{Repeat, RepeatUnit};
 
 /// The fields of a reminder that this program reads and writes.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReminderData {
     pub title: String,
     pub notes: String,
@@ -28,6 +29,7 @@ pub struct ReminderData {
     pub repeat: Option<Repeat>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Reminder {
     /// EventKit's identifier, e.g. "3A365278-64BD-44F4-8DF6-F1C075B03AB1".
     pub id: String,
@@ -36,6 +38,22 @@ pub struct Reminder {
     /// Name of the list the reminder is in.
     pub list: String,
     pub data: ReminderData,
+}
+
+/// What the rest of the program needs from a reminders list. `RemindersList`
+/// is the real one; the tests use an in-memory fake instead.
+pub trait Backend {
+    /// Name of the list.
+    fn name(&self) -> String;
+    /// All reminders in the list, completed ones included.
+    fn all(&self) -> Result<Vec<Reminder>>;
+    fn get(&self, id: &str) -> Option<Reminder>;
+    /// Creates a reminder and returns its identifier. It goes in the list
+    /// called `list`, or in this list when `list` is `None`.
+    fn create(&self, data: &ReminderData, list: Option<&str>) -> Result<String>;
+    fn update(&self, id: &str, data: &ReminderData) -> Result<()>;
+    /// Deletes a reminder. Does nothing if it's already gone.
+    fn delete(&self, id: &str) -> Result<()>;
 }
 
 /// One list in the Reminders app.
@@ -55,67 +73,6 @@ impl RemindersList {
             None => create_calendar(&store, name)?,
         };
         Ok(RemindersList { store, calendar })
-    }
-
-    pub fn name(&self) -> String {
-        unsafe { self.calendar.title() }.to_string()
-    }
-
-    /// All reminders in the list, completed ones included.
-    pub fn all(&self) -> Result<Vec<Reminder>> {
-        // EventKit answers on a background thread by calling `handler`. The
-        // reminders are converted to plain Rust data there and sent back
-        // through a channel, which `recv` below waits on.
-        let (tx, rx) = mpsc::channel();
-        let handler = RcBlock::new(move |array: *mut NSArray<EKReminder>| {
-            let reminders = match unsafe { array.as_ref() } {
-                Some(array) => array.iter().map(|r| to_reminder(&r)).collect(),
-                None => Vec::new(),
-            };
-            let _ = tx.send(reminders);
-        });
-        let calendars = NSArray::from_retained_slice(std::slice::from_ref(&self.calendar));
-        unsafe {
-            let predicate = self.store.predicateForRemindersInCalendars(Some(&calendars));
-            self.store.fetchRemindersMatchingPredicate_completion(&predicate, &handler);
-        }
-        rx.recv().context("Reminders did not respond")
-    }
-
-    pub fn get(&self, id: &str) -> Option<Reminder> {
-        self.find(id).map(|r| to_reminder(&r))
-    }
-
-    /// Creates a reminder and returns its EventKit identifier. It goes in the
-    /// list called `list`, or in this list when `list` is `None`.
-    pub fn create(&self, data: &ReminderData, list: Option<&str>) -> Result<String> {
-        let calendar = match list {
-            Some(name) if name != self.name() => {
-                match find_calendar(&self.store, name) {
-                    Some(calendar) => calendar,
-                    None => create_calendar(&self.store, name)?,
-                }
-            }
-            _ => self.calendar.clone(),
-        };
-        let reminder = unsafe { EKReminder::reminderWithEventStore(&self.store) };
-        unsafe { reminder.setCalendar(Some(&calendar)) };
-        self.save(&reminder, data)?;
-        Ok(unsafe { reminder.calendarItemIdentifier() }.to_string())
-    }
-
-    pub fn update(&self, id: &str, data: &ReminderData) -> Result<()> {
-        let reminder = self.find(id).context("the reminder no longer exists")?;
-        self.save(&reminder, data)
-    }
-
-    /// Deletes a reminder. Does nothing if it's already gone.
-    pub fn delete(&self, id: &str) -> Result<()> {
-        if let Some(reminder) = self.find(id) {
-            unsafe { self.store.removeReminder_commit_error(&reminder, true) }
-                .map_err(ns_error)?;
-        }
-        Ok(())
     }
 
     fn find(&self, id: &str) -> Option<Retained<EKReminder>> {
@@ -147,6 +104,71 @@ impl RemindersList {
             }
             self.store.saveReminder_commit_error(reminder, true).map_err(ns_error)
         }
+    }
+
+    /// Deletes the whole list. Only used to clean up after tests.
+    #[cfg(test)]
+    pub fn delete_list(self) -> Result<()> {
+        unsafe { self.store.removeCalendar_commit_error(&self.calendar, true) }.map_err(ns_error)
+    }
+}
+
+impl Backend for RemindersList {
+    fn name(&self) -> String {
+        unsafe { self.calendar.title() }.to_string()
+    }
+
+    fn all(&self) -> Result<Vec<Reminder>> {
+        // EventKit answers on a background thread by calling `handler`. The
+        // reminders are converted to plain Rust data there and sent back
+        // through a channel, which `recv` below waits on.
+        let (tx, rx) = mpsc::channel();
+        let handler = RcBlock::new(move |array: *mut NSArray<EKReminder>| {
+            let reminders = match unsafe { array.as_ref() } {
+                Some(array) => array.iter().map(|r| to_reminder(&r)).collect(),
+                None => Vec::new(),
+            };
+            let _ = tx.send(reminders);
+        });
+        let calendars = NSArray::from_retained_slice(std::slice::from_ref(&self.calendar));
+        unsafe {
+            let predicate = self.store.predicateForRemindersInCalendars(Some(&calendars));
+            self.store.fetchRemindersMatchingPredicate_completion(&predicate, &handler);
+        }
+        rx.recv().context("Reminders did not respond")
+    }
+
+    fn get(&self, id: &str) -> Option<Reminder> {
+        self.find(id).map(|r| to_reminder(&r))
+    }
+
+    fn create(&self, data: &ReminderData, list: Option<&str>) -> Result<String> {
+        let calendar = match list {
+            Some(name) if name != self.name() => {
+                match find_calendar(&self.store, name) {
+                    Some(calendar) => calendar,
+                    None => create_calendar(&self.store, name)?,
+                }
+            }
+            _ => self.calendar.clone(),
+        };
+        let reminder = unsafe { EKReminder::reminderWithEventStore(&self.store) };
+        unsafe { reminder.setCalendar(Some(&calendar)) };
+        self.save(&reminder, data)?;
+        Ok(unsafe { reminder.calendarItemIdentifier() }.to_string())
+    }
+
+    fn update(&self, id: &str, data: &ReminderData) -> Result<()> {
+        let reminder = self.find(id).context("the reminder no longer exists")?;
+        self.save(&reminder, data)
+    }
+
+    fn delete(&self, id: &str) -> Result<()> {
+        if let Some(reminder) = self.find(id) {
+            unsafe { self.store.removeReminder_commit_error(&reminder, true) }
+                .map_err(ns_error)?;
+        }
+        Ok(())
     }
 }
 
@@ -261,4 +283,168 @@ fn date_components(date: NaiveDate) -> Retained<NSDateComponents> {
 
 fn ns_error(error: Retained<NSError>) -> anyhow::Error {
     anyhow!("Reminders: {}", error.localizedDescription())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn date(text: &str) -> NaiveDate {
+        text.parse().unwrap()
+    }
+
+    fn data(title: &str) -> ReminderData {
+        ReminderData {
+            title: title.to_string(),
+            notes: String::new(),
+            done: false,
+            due: None,
+            priority: 0,
+            repeat: None,
+        }
+    }
+
+    /// An unsaved reminder. Building one needs no permission, so these tests
+    /// run without touching the Reminders app.
+    fn unsaved_reminder() -> Retained<EKReminder> {
+        let store = unsafe { EKEventStore::new() };
+        unsafe { EKReminder::reminderWithEventStore(&store) }
+    }
+
+    #[test]
+    fn due_date_round_trips_through_date_components() {
+        let reminder = unsaved_reminder();
+        assert_eq!(due_date(&reminder), None);
+        for text in ["2026-10-20", "2027-02-28", "2028-02-29"] {
+            unsafe { reminder.setDueDateComponents(Some(&date_components(date(text)))) };
+            assert_eq!(due_date(&reminder), Some(date(text)));
+        }
+    }
+
+    #[test]
+    fn due_date_ignores_the_time_of_day() {
+        let reminder = unsaved_reminder();
+        let components = date_components(date("2026-10-20"));
+        components.setHour(14);
+        unsafe { reminder.setDueDateComponents(Some(&components)) };
+        assert_eq!(due_date(&reminder), Some(date("2026-10-20")));
+    }
+
+    #[test]
+    fn repeat_round_trips_through_a_recurrence_rule() {
+        let reminder = unsaved_reminder();
+        assert_eq!(repeat_of(&reminder), None);
+        for unit in [RepeatUnit::Day, RepeatUnit::Week, RepeatUnit::Month, RepeatUnit::Year] {
+            for interval in [1, 3] {
+                let repeat = Repeat { unit, interval };
+                let rules = NSArray::from_retained_slice(&[recurrence_rule(repeat)]);
+                unsafe { reminder.setRecurrenceRules(Some(&rules)) };
+                assert_eq!(repeat_of(&reminder), Some(repeat));
+            }
+        }
+    }
+
+    #[test]
+    fn to_reminder_reads_every_field() {
+        let reminder = unsaved_reminder();
+        unsafe {
+            reminder.setTitle(Some(&NSString::from_str("Dentist")));
+            reminder.setNotes(Some(&NSString::from_str("#health")));
+            reminder.setPriority(5);
+            reminder.setDueDateComponents(Some(&date_components(date("2026-10-20"))));
+            reminder.setCompleted(true);
+        }
+        let read = to_reminder(&reminder).data;
+        assert_eq!(
+            read,
+            ReminderData {
+                title: "Dentist".into(),
+                notes: "#health".into(),
+                done: true,
+                due: Some(date("2026-10-20")),
+                priority: 5,
+                repeat: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ns_error_mentions_reminders() {
+        let error = unsafe {
+            NSError::errorWithDomain_code_userInfo(&NSString::from_str("TestDomain"), 7, None)
+        };
+        let message = ns_error(error).to_string();
+        assert!(message.starts_with("Reminders: ") && message.contains("TestDomain"), "{message}");
+    }
+
+    // --- Against the real Reminders app ---------------------------------------
+    //
+    // These create a temporary list (it syncs to iCloud briefly) and delete it
+    // again. They need Reminders access, so they only run when asked for:
+    //     cargo test -- --ignored
+
+    /// Opens a fresh temporary list, runs `test` on it, and always deletes it.
+    /// Tests run in parallel, so each one passes its own `label`.
+    fn with_temporary_list(label: &str, test: impl FnOnce(&RemindersList)) {
+        let name = format!("todo-cli-test-{label}-{}", std::process::id());
+        let list = RemindersList::open(&name).expect("Reminders access is needed");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(&list)));
+        list.delete_list().unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    #[ignore = "uses the real Reminders app; run with `cargo test -- --ignored`"]
+    fn real_reminders_create_read_update_delete() {
+        with_temporary_list("crud", |list| {
+            assert!(list.name().starts_with("todo-cli-test-crud-"));
+            assert!(list.all().unwrap().is_empty());
+
+            let mut written = ReminderData {
+                notes: "Bring report\n#work".into(),
+                due: Some(date("2030-01-15")),
+                priority: 1,
+                repeat: Some(Repeat { unit: RepeatUnit::Week, interval: 2 }),
+                ..data("Integration test")
+            };
+            let id = list.create(&written, None).unwrap();
+            let read = list.get(&id).unwrap();
+            assert_eq!((read.list.as_str(), &read.data), (list.name().as_str(), &written));
+            assert_eq!(list.all().unwrap().len(), 1);
+
+            written.title = "Renamed".into();
+            written.due = None;
+            written.repeat = None;
+            list.update(&id, &written).unwrap();
+            assert_eq!(list.get(&id).unwrap().data, written);
+
+            list.delete(&id).unwrap();
+            assert!(list.get(&id).is_none());
+            list.delete(&id).unwrap(); // deleting twice is fine
+            assert!(list.update(&id, &written).is_err());
+        });
+    }
+
+    #[test]
+    #[ignore = "uses the real Reminders app; run with `cargo test -- --ignored`"]
+    fn real_reminders_completing_a_repeating_reminder_moves_it_forward() {
+        with_temporary_list("repeat", |list| {
+            let mut written = ReminderData {
+                due: Some(date("2030-01-15")),
+                repeat: Some(Repeat { unit: RepeatUnit::Week, interval: 1 }),
+                ..data("Water plants")
+            };
+            let id = list.create(&written, None).unwrap();
+            written.done = true;
+            list.update(&id, &written).unwrap();
+
+            let next = list.get(&id).unwrap().data;
+            assert!(!next.done);
+            assert_eq!(next.due, Some(date("2030-01-22")));
+            let all = list.all().unwrap();
+            assert_eq!(all.iter().filter(|r| r.data.done).count(), 1, "a completed copy is kept");
+        });
+    }
 }

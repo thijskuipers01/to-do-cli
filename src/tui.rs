@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::reminders::Backend;
 use crate::store::{Filter, Store};
 use crate::task::{self, DueStatus, Priority, Repeat, Task};
 
@@ -16,7 +17,7 @@ const HELP: &str =
 
 /// Runs the interactive UI. The terminal is restored afterwards, even when
 /// the app stops with an error.
-pub fn run(db: &mut Store) -> Result<()> {
+pub fn run<B: Backend>(db: &mut Store<B>) -> Result<()> {
     let mut app = App::new(db)?;
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
@@ -32,8 +33,8 @@ enum Mode {
     Form(Box<Form>),
 }
 
-struct App<'a> {
-    db: &'a mut Store,
+struct App<'a, B: Backend> {
+    db: &'a mut Store<B>,
     filter: Filter,
     tasks: Vec<Task>,
     table_state: TableState,
@@ -43,8 +44,8 @@ struct App<'a> {
     quit: bool,
 }
 
-impl<'a> App<'a> {
-    fn new(db: &'a mut Store) -> Result<Self> {
+impl<'a, B: Backend> App<'a, B> {
+    fn new(db: &'a mut Store<B>) -> Result<Self> {
         let mut app = App {
             db,
             filter: Filter::default(),
@@ -416,4 +417,306 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(area);
     area
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::task::RepeatUnit;
+    use crate::testing::{self, FakeList};
+
+    fn press(app: &mut App<FakeList>, code: KeyCode) {
+        app.handle_key(code).unwrap();
+    }
+
+    fn type_text(app: &mut App<FakeList>, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn titles(app: &App<FakeList>) -> Vec<String> {
+        app.tasks.iter().map(|t| t.title.clone()).collect()
+    }
+
+    /// Everything on screen as one string, row after row.
+    fn screen(app: &mut App<FakeList>) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(110, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    fn form(fields: [&str; 5]) -> Form {
+        Form { fields: fields.map(String::from), ..Form::new_task() }
+    }
+
+    // --- Form ---------------------------------------------------------------
+
+    #[test]
+    fn new_form_is_empty() {
+        let form = Form::new_task();
+        assert!(form.editing.is_none() && form.error.is_none());
+        assert!(form.fields.iter().all(String::is_empty));
+        assert_eq!(form.focus, 0);
+    }
+
+    #[test]
+    fn edit_form_is_filled_from_the_task() {
+        let task = Task {
+            due: Some("2026-10-20".parse().unwrap()),
+            priority: Priority::High,
+            tags: vec!["a".into(), "b".into()],
+            repeat: Some(Repeat { unit: RepeatUnit::Week, interval: 2 }),
+            ..Task::new("Title")
+        };
+        let form = Form::edit(task);
+        assert_eq!(form.fields, ["Title", "2026-10-20", "high", "a, b", "every 2 weeks"]);
+        assert!(form.editing.is_some());
+    }
+
+    #[test]
+    fn form_parses_valid_input() {
+        let values = form([" Milk ", "2026-10-20", "HIGH", "home, , shop ", "2 weeks"]).parse().unwrap();
+        assert_eq!(values.title, "Milk");
+        assert_eq!(values.due, Some("2026-10-20".parse().unwrap()));
+        assert_eq!(values.priority, Priority::High);
+        assert_eq!(values.tags, ["home", "shop"]);
+        assert_eq!(values.repeat, Some(Repeat { unit: RepeatUnit::Week, interval: 2 }));
+    }
+
+    #[test]
+    fn form_treats_empty_optional_fields_as_unset() {
+        let values = form(["Milk", "", "", "", ""]).parse().unwrap();
+        assert_eq!((values.due, values.priority, values.repeat), (None, Priority::None, None));
+        assert!(values.tags.is_empty());
+    }
+
+    #[test]
+    fn form_explains_invalid_input() {
+        assert_eq!(form(["  ", "", "", "", ""]).parse().err().unwrap(), "Title can't be empty");
+        assert!(form(["a", "someday", "", "", ""]).parse().err().unwrap().contains("YYYY-MM-DD"));
+        assert_eq!(
+            form(["a", "", "urgent", "", ""]).parse().err().unwrap(),
+            "Priority must be none, low, medium or high"
+        );
+        assert!(form(["a", "", "", "", "fortnight"]).parse().err().unwrap().contains("2 weeks"));
+    }
+
+    #[test]
+    fn centered_fits_inside_the_area() {
+        assert_eq!(centered(Rect::new(0, 0, 100, 40), 70, 10), Rect::new(15, 15, 70, 10));
+        assert_eq!(centered(Rect::new(0, 0, 50, 5), 70, 10), Rect::new(0, 0, 50, 5));
+    }
+
+    // --- App ----------------------------------------------------------------
+
+    #[test]
+    fn adding_through_the_form_saves_every_field() {
+        let mut db = testing::store();
+        let mut app = App::new(&mut db).unwrap();
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "Milk");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "2026-10-20");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "high");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "home, shop");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "week");
+        press(&mut app, KeyCode::Enter);
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.message.as_deref(), Some("Added task 1"));
+        let task = app.selected().unwrap().clone();
+        assert_eq!(task.title, "Milk");
+        assert_eq!(task.due_label(), "2026-10-20 ↻");
+        assert_eq!((task.priority, task.tags), (Priority::High, vec!["home".into(), "shop".into()]));
+    }
+
+    #[test]
+    fn form_keys_move_focus_and_edit_text() {
+        let mut db = testing::store();
+        let mut app = App::new(&mut db).unwrap();
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "Mikl");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "lk");
+        press(&mut app, KeyCode::BackTab);
+        let Mode::Form(form) = &app.mode else { panic!("form closed") };
+        assert_eq!((form.fields[0].as_str(), form.focus), ("Milk", 4), "BackTab wraps to the last field");
+        press(&mut app, KeyCode::Down);
+        let Mode::Form(form) = &app.mode else { panic!("form closed") };
+        assert_eq!(form.focus, 0);
+    }
+
+    #[test]
+    fn invalid_form_stays_open_with_an_error() {
+        let mut db = testing::store();
+        let mut app = App::new(&mut db).unwrap();
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+        let Mode::Form(form) = &app.mode else { panic!("form closed") };
+        assert_eq!(form.error.as_deref(), Some("Title can't be empty"));
+        assert!(app.tasks.is_empty());
+    }
+
+    #[test]
+    fn escape_cancels_the_form() {
+        let mut db = testing::store();
+        let mut app = App::new(&mut db).unwrap();
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "Never mind");
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.tasks.is_empty());
+    }
+
+    #[test]
+    fn editing_changes_the_selected_task() {
+        let mut db = testing::store();
+        db.add(&Task { notes: "keep".into(), ..Task::new("Old") }).unwrap();
+        let mut app = App::new(&mut db).unwrap();
+        press(&mut app, KeyCode::Char('e'));
+        type_text(&mut app, " name");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.message.as_deref(), Some("Updated task 1"));
+        let task = app.selected().unwrap();
+        assert_eq!((task.title.as_str(), task.notes.as_str()), ("Old name", "keep"));
+    }
+
+    #[test]
+    fn space_toggles_done() {
+        let mut db = testing::store();
+        db.add(&Task::new("a")).unwrap();
+        let mut app = App::new(&mut db).unwrap();
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.selected().unwrap().done);
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.selected().unwrap().done);
+    }
+
+    #[test]
+    fn delete_then_undo() {
+        let mut db = testing::store();
+        db.add(&Task::new("a")).unwrap();
+        let mut app = App::new(&mut db).unwrap();
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.tasks.is_empty());
+        assert_eq!(app.message.as_deref(), Some("Removed task 1 (u to undo)"));
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(titles(&app), ["a"]);
+        assert_eq!(app.message.as_deref(), Some("Undid remove of task 1"));
+    }
+
+    #[test]
+    fn undo_with_nothing_to_undo_says_so() {
+        let mut db = testing::store();
+        let mut app = App::new(&mut db).unwrap();
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.message.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn arrow_keys_and_j_k_move_the_selection() {
+        let mut db = testing::store();
+        for title in ["a", "b", "c"] {
+            db.add(&Task::new(title)).unwrap();
+        }
+        let mut app = App::new(&mut db).unwrap();
+        assert_eq!(app.table_state.selected(), Some(0));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected().unwrap().title, "c");
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.selected().unwrap().title, "a");
+    }
+
+    #[test]
+    fn search_filters_while_typing() {
+        let mut db = testing::store();
+        for title in ["Buy milk", "Call mom", "Milk the cow"] {
+            db.add(&Task::new(title)).unwrap();
+        }
+        let mut app = App::new(&mut db).unwrap();
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "milkx");
+        assert!(app.tasks.is_empty());
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(titles(&app), ["Buy milk", "Milk the cow"]);
+
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.tasks.len(), 2, "Enter keeps the search");
+
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.tasks.len(), 3, "Esc clears the search");
+        assert!(app.filter.search.is_none());
+    }
+
+    #[test]
+    fn s_cycles_sorting_and_h_hides_done() {
+        let mut db = testing::store();
+        db.add(&Task { priority: Priority::Low, ..Task::new("low") }).unwrap();
+        db.add(&Task { priority: Priority::High, ..Task::new("high") }).unwrap();
+        let done = db.add(&Task::new("finished")).unwrap();
+        db.set_done(done.id, true).unwrap();
+        let mut app = App::new(&mut db).unwrap();
+
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.filter.sort, crate::store::SortKey::Priority);
+        assert_eq!(titles(&app), ["high", "low", "finished"]);
+
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(titles(&app), ["high", "low"]);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.tasks.len(), 3);
+    }
+
+    #[test]
+    fn q_and_escape_quit() {
+        for key in [KeyCode::Char('q'), KeyCode::Esc] {
+            let mut db = testing::store();
+            let mut app = App::new(&mut db).unwrap();
+            press(&mut app, key);
+            assert!(app.quit);
+        }
+    }
+
+    #[test]
+    fn screen_shows_list_tasks_and_help() {
+        let mut db = testing::store();
+        let task = db.add(&Task { tags: vec!["work".into()], ..Task::new("Write report") }).unwrap();
+        db.set_done(task.id, true).unwrap();
+        let mut app = App::new(&mut db).unwrap();
+        let text = screen(&mut app);
+        for expected in ["Todo · sort: id", "Write report", "work", "✓", "a add", "q quit"] {
+            assert!(text.contains(expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn screen_shows_search_and_form() {
+        let mut db = testing::store();
+        let mut app = App::new(&mut db).unwrap();
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "abc");
+        let text = screen(&mut app);
+        assert!(text.contains("Search: abc") && text.contains("search: \"abc\""));
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+        let text = screen(&mut app);
+        for expected in ["New task", "Title", "Repeat", "Title can't be empty"] {
+            assert!(text.contains(expected), "missing {expected:?}");
+        }
+    }
 }

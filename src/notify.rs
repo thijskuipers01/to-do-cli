@@ -1,35 +1,45 @@
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use chrono::Days;
+use chrono::{Days, NaiveDate};
 
+use crate::reminders::Backend;
 use crate::store::{Filter, Store};
 use crate::task;
 
 /// Shows a desktop notification listing the unfinished tasks due tomorrow.
 /// Does nothing when there are none.
-pub fn due_tomorrow(db: &Store) -> Result<()> {
-    let tomorrow = task::today() + Days::new(1);
+pub fn due_tomorrow<B: Backend>(db: &Store<B>) -> Result<()> {
+    let titles = titles_due_on(db, task::today() + Days::new(1))?;
+    match notification(&titles) {
+        None => println!("No tasks due tomorrow"),
+        Some((heading, body)) => {
+            println!("{heading}: {body}");
+            show(&heading, &body)?;
+        }
+    }
+    Ok(())
+}
+
+/// Titles of the unfinished tasks due on `date`.
+fn titles_due_on<B: Backend>(db: &Store<B>, date: NaiveDate) -> Result<Vec<String>> {
     let filter = Filter { pending_only: true, ..Filter::default() };
-    let titles: Vec<String> = db
+    Ok(db
         .list(&filter)?
         .into_iter()
-        .filter(|t| t.due == Some(tomorrow))
+        .filter(|t| t.due == Some(date))
         .map(|t| t.title)
-        .collect();
+        .collect())
+}
 
-    if titles.is_empty() {
-        println!("No tasks due tomorrow");
-        return Ok(());
-    }
-
+/// The notification's heading and body, or `None` when there's nothing to say.
+fn notification(titles: &[String]) -> Option<(String, String)> {
     let heading = match titles.len() {
+        0 => return None,
         1 => "1 task due tomorrow".to_string(),
         n => format!("{n} tasks due tomorrow"),
     };
-    let body = titles.join(", ");
-    println!("{heading}: {body}");
-    show(&heading, &body)
+    Some((heading, titles.join(", ")))
 }
 
 /// Shows a macOS notification using `osascript`. The text is passed as
@@ -56,4 +66,48 @@ fn show(heading: &str, body: &str) -> Result<()> {
         bail!("osascript failed ({status})");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::Task;
+    use crate::testing;
+
+    fn date(text: &str) -> NaiveDate {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn titles_due_on_skips_other_dates_and_finished_tasks() {
+        let mut db = testing::store();
+        let due = Some(date("2026-10-18"));
+        db.add(&Task { due, ..Task::new("Dentist") }).unwrap();
+        db.add(&Task { due: Some(date("2026-10-19")), ..Task::new("Later") }).unwrap();
+        db.add(&Task::new("No date")).unwrap();
+        let done = db.add(&Task { due, ..Task::new("Already done") }).unwrap();
+        db.set_done(done.id, true).unwrap();
+
+        assert_eq!(titles_due_on(&db, date("2026-10-18")).unwrap(), ["Dentist"]);
+    }
+
+    #[test]
+    fn notification_is_empty_without_tasks() {
+        assert_eq!(notification(&[]), None);
+    }
+
+    #[test]
+    fn notification_text_for_one_task() {
+        let (heading, body) = notification(&["Dentist".to_string()]).unwrap();
+        assert_eq!(heading, "1 task due tomorrow");
+        assert_eq!(body, "Dentist");
+    }
+
+    #[test]
+    fn notification_text_for_several_tasks() {
+        let titles = ["Dentist".to_string(), "Pay rent".to_string()];
+        let (heading, body) = notification(&titles).unwrap();
+        assert_eq!(heading, "2 tasks due tomorrow");
+        assert_eq!(body, "Dentist, Pay rent");
+    }
 }
