@@ -1,39 +1,37 @@
-use std::fs;
-use std::path::Path;
+mod display;
+mod notify;
+mod reminders;
+mod store;
+mod task;
+mod tui;
+
+use std::env;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
 
-/// File where tasks are stored (in the current directory for now).
-const DATA_FILE: &str = "tasks.json";
+use store::{Filter, SortKey, Store};
+use task::Priority;
 
-// ---------------------------------------------------------------------------
-// Data model
-// ---------------------------------------------------------------------------
-
-/// A single to-do item. `Serialize`/`Deserialize` let serde convert it
-/// to and from JSON automatically.
-#[derive(Debug, Serialize, Deserialize)]
-struct Task {
-    id: u32,
-    title: String,
-    done: bool,
+/// The Reminders list that holds the tasks: `$TODO_LIST` if set, otherwise "Todo".
+fn list_name() -> String {
+    env::var("TODO_LIST").unwrap_or_else(|_| "Todo".to_string())
 }
 
-/// Everything stored in the data file: the tasks plus a counter for the
-/// next ID. The counter only ever goes up, so IDs are never reused, even
-/// after the task with the highest ID is removed.
-#[derive(Debug, Serialize, Deserialize)]
-struct TodoList {
-    next_id: u32,
-    tasks: Vec<Task>,
-}
-
-impl Default for TodoList {
-    fn default() -> Self {
-        TodoList { next_id: 1, tasks: Vec::new() }
+/// Where the local state (short IDs and undo history) lives: `$TODO_STATE` if
+/// set, otherwise `$XDG_DATA_HOME/todo/state.db`, which defaults to
+/// `~/.local/share/todo/state.db`.
+fn state_path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("TODO_STATE") {
+        return Ok(PathBuf::from(path));
     }
+    let data_dir = match env::var_os("XDG_DATA_HOME") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(env::var_os("HOME").context("HOME is not set")?).join(".local/share"),
+    };
+    Ok(data_dir.join("todo").join("state.db"))
 }
 
 // ---------------------------------------------------------------------------
@@ -53,56 +51,70 @@ enum Command {
     Add {
         /// The task description
         title: String,
+        /// Due date: YYYY-MM-DD, "today", "tomorrow" or a weekday ("friday")
+        #[arg(short, long, value_parser = task::parse_due)]
+        due: Option<NaiveDate>,
+        /// How urgent the task is
+        #[arg(short, long, value_enum, default_value_t = Priority::None)]
+        priority: Priority,
+        /// Tag to attach; repeat for more (-t work -t urgent)
+        #[arg(short, long = "tag")]
+        tags: Vec<String>,
     },
-    /// List all tasks
-    List,
+    /// Change the title, due date, priority or tags of a task
+    Edit {
+        /// ID of the task
+        id: i64,
+        /// New title
+        #[arg(long)]
+        title: Option<String>,
+        /// New due date (same formats as `add`)
+        #[arg(short, long, value_parser = task::parse_due, conflicts_with = "no_due")]
+        due: Option<NaiveDate>,
+        /// Remove the due date
+        #[arg(long)]
+        no_due: bool,
+        /// New priority
+        #[arg(short, long, value_enum)]
+        priority: Option<Priority>,
+        /// Tag to add; repeat for more
+        #[arg(short, long = "tag")]
+        tags: Vec<String>,
+        /// Tag to remove; repeat for more
+        #[arg(long = "untag")]
+        untags: Vec<String>,
+    },
+    /// List tasks
+    List {
+        /// Only show tasks with this tag
+        #[arg(short, long)]
+        tag: Option<String>,
+        /// Only show tasks with this priority
+        #[arg(short, long, value_enum)]
+        priority: Option<Priority>,
+        /// Hide completed tasks
+        #[arg(long)]
+        pending: bool,
+        /// Order of the list
+        #[arg(short, long, value_enum, default_value_t = SortKey::Id)]
+        sort: SortKey,
+    },
     /// Mark a task as done
     Done {
         /// ID of the task
-        id: u32,
+        id: i64,
     },
     /// Remove a task
     Remove {
         /// ID of the task
-        id: u32,
+        id: i64,
     },
-}
-
-// ---------------------------------------------------------------------------
-// Storage: load from / save to the JSON file
-// ---------------------------------------------------------------------------
-
-fn load_list(path: &Path) -> Result<TodoList> {
-    // No file yet? Then we simply start with an empty list.
-    if !path.exists() {
-        return Ok(TodoList::default());
-    }
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("could not read {}", path.display()))?;
-    let list = serde_json::from_str(&contents)
-        .with_context(|| format!("{} contains invalid JSON", path.display()))?;
-    Ok(list)
-}
-
-fn save_list(path: &Path, list: &TodoList) -> Result<()> {
-    let json = serde_json::to_string_pretty(list)?;
-    fs::write(path, json).with_context(|| format!("could not write {}", path.display()))?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Task logic
-// ---------------------------------------------------------------------------
-
-fn print_tasks(tasks: &[Task]) {
-    if tasks.is_empty() {
-        println!("No tasks yet. Add one with: todo add \"Buy milk\"");
-        return;
-    }
-    for task in tasks {
-        let mark = if task.done { "x" } else { " " };
-        println!("{:>3}. [{}] {}", task.id, mark, task.title);
-    }
+    /// Undo the last change (can be repeated)
+    Undo,
+    /// Open the interactive terminal UI
+    Tui,
+    /// Show a desktop notification for unfinished tasks due tomorrow
+    Notify,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,43 +123,60 @@ fn print_tasks(tasks: &[Task]) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let path = Path::new(DATA_FILE);
-    let mut list = load_list(path)?;
+    let mut db = Store::open(&state_path()?, &list_name())?;
 
     match cli.command {
-        Command::Add { title } => {
-            let id = list.next_id;
-            list.next_id += 1;
-            println!("Added task {id}: {title}");
-            list.tasks.push(Task { id, title, done: false });
-            save_list(path, &list)?;
+        Command::Add { title, due, priority, tags } => {
+            let task = db.add(&title, due, priority, &tags)?;
+            println!("Added task {}: {}", task.id, task.title);
         }
-        Command::List => {
-            print_tasks(&list.tasks);
+        Command::Edit { id, title, due, no_due, priority, tags, untags } => {
+            if title.is_none()
+                && due.is_none()
+                && !no_due
+                && priority.is_none()
+                && tags.is_empty()
+                && untags.is_empty()
+            {
+                bail!("nothing to change; see `todo edit --help` for the options");
+            }
+
+            let mut task = db.get(id)?.with_context(|| format!("no task with id {id}"))?;
+            if let Some(title) = title {
+                task.title = title;
+            }
+            if no_due {
+                task.due = None;
+            } else if due.is_some() {
+                task.due = due;
+            }
+            if let Some(priority) = priority {
+                task.priority = priority;
+            }
+            task.tags.retain(|tag| !untags.contains(tag));
+            task.tags.extend(tags);
+
+            let task = db.update(&task)?;
+            println!("Updated task {id}: {}", task.title);
+        }
+        Command::List { tag, priority, pending, sort } => {
+            let filter = Filter { tag, priority, pending_only: pending, sort };
+            display::print_tasks(&db.list(&filter)?);
         }
         Command::Done { id } => {
-            // `iter_mut().find(..)` gives Option<&mut Task>: a mutable borrow
-            // of the matching task inside the Vec.
-            match list.tasks.iter_mut().find(|t| t.id == id) {
-                Some(task) => {
-                    task.done = true;
-                    println!("Completed task {id}: {}", task.title);
-                    save_list(path, &list)?;
-                }
-                None => bail!("no task with id {id}"),
-            }
+            let task = db.set_done(id, true)?;
+            println!("Completed task {id}: {}", task.title);
         }
         Command::Remove { id } => {
-            // `position` returns the index of the first match, if any.
-            match list.tasks.iter().position(|t| t.id == id) {
-                Some(index) => {
-                    let removed = list.tasks.remove(index);
-                    println!("Removed task {id}: {}", removed.title);
-                    save_list(path, &list)?;
-                }
-                None => bail!("no task with id {id}"),
-            }
+            let task = db.remove(id)?;
+            println!("Removed task {id}: {}", task.title);
         }
+        Command::Undo => match db.undo()? {
+            Some(what) => println!("Undid {what}"),
+            None => println!("Nothing to undo"),
+        },
+        Command::Tui => tui::run(&mut db)?,
+        Command::Notify => notify::due_tomorrow(&db)?,
     }
 
     Ok(())
