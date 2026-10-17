@@ -46,6 +46,65 @@ impl Priority {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepeatUnit {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+/// How often a task comes back, e.g. every 2 weeks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Repeat {
+    pub unit: RepeatUnit,
+    pub interval: u32,
+}
+
+impl Repeat {
+    /// "every week", "every 2 weeks", ...
+    pub fn label(self) -> String {
+        let unit = match self.unit {
+            RepeatUnit::Day => "day",
+            RepeatUnit::Week => "week",
+            RepeatUnit::Month => "month",
+            RepeatUnit::Year => "year",
+        };
+        match self.interval {
+            1 => format!("every {unit}"),
+            n => format!("every {n} {unit}s"),
+        }
+    }
+}
+
+/// Parses a repeat interval: "week", "every week", "2 weeks", "weekly", ...
+pub fn parse_repeat(input: &str) -> Result<Repeat, String> {
+    let error = || {
+        format!("expected something like \"week\", \"2 weeks\" or \"monthly\", got \"{input}\"")
+    };
+    let lower = input.trim().to_lowercase();
+    let mut words: Vec<&str> = lower.split_whitespace().collect();
+    if words.first() == Some(&"every") {
+        words.remove(0);
+    }
+    let (interval, unit) = match words.as_slice() {
+        [unit] => (1, *unit),
+        [count, unit] => (count.parse().map_err(|_| error())?, *unit),
+        _ => return Err(error()),
+    };
+    let unit = match unit.trim_end_matches('s') {
+        "day" | "daily" => RepeatUnit::Day,
+        "week" | "weekly" => RepeatUnit::Week,
+        "month" | "monthly" => RepeatUnit::Month,
+        "year" | "yearly" => RepeatUnit::Year,
+        _ => return Err(error()),
+    };
+    if interval == 0 {
+        return Err(error());
+    }
+    Ok(Repeat { unit, interval })
+}
+
 /// A single to-do item, stored as a reminder in the Reminders app. Serde is
 /// still used here: the undo history stores snapshots of tasks as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +117,28 @@ pub struct Task {
     pub tags: Vec<String>,
     /// The reminder's notes, apart from the line of hashtags holding the tags.
     pub notes: String,
+    #[serde(default)]
+    pub repeat: Option<Repeat>,
+    /// Name of the Reminders list the task is in.
+    #[serde(default)]
+    pub list: String,
+}
+
+impl Task {
+    /// A new, open task with only a title. The ID is assigned when it's saved.
+    pub fn new(title: &str) -> Task {
+        Task {
+            id: 0,
+            title: title.to_string(),
+            done: false,
+            due: None,
+            priority: Priority::None,
+            tags: Vec::new(),
+            notes: String::new(),
+            repeat: None,
+            list: String::new(),
+        }
+    }
 }
 
 pub enum DueStatus {
@@ -69,6 +150,15 @@ pub enum DueStatus {
 impl Task {
     /// Where the due date stands relative to `today`, or `None` if the task
     /// has no due date or is already done.
+    /// The due date as text, with "↻" added for repeating tasks.
+    pub fn due_label(&self) -> String {
+        match (self.due, self.repeat) {
+            (Some(due), Some(_)) => format!("{due} ↻"),
+            (Some(due), None) => due.to_string(),
+            (None, _) => String::new(),
+        }
+    }
+
     pub fn due_status(&self, today: NaiveDate) -> Option<DueStatus> {
         let due = self.due?;
         if self.done {

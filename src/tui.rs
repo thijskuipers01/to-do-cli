@@ -9,10 +9,10 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::store::{Filter, Store};
-use crate::task::{self, DueStatus, Priority, Task};
+use crate::task::{self, DueStatus, Priority, Repeat, Task};
 
 const HELP: &str =
-    "a add · e edit · space done · d delete · u undo · s sort · h hide done · q quit";
+    "a add · e edit · space done · d delete · u undo · / search · s sort · h hide done · q quit";
 
 /// Runs the interactive UI. The terminal is restored afterwards, even when
 /// the app stops with an error.
@@ -26,6 +26,8 @@ pub fn run(db: &mut Store) -> Result<()> {
 
 enum Mode {
     Normal,
+    /// Typing a search; the list filters as you type.
+    Search,
     /// The add/edit form is open. Boxed so `Mode` stays small.
     Form(Box<Form>),
 }
@@ -114,23 +116,48 @@ impl<'a> App<'a> {
                 },
                 _ => {}
             },
+            Mode::Search => self.handle_search_key(code)?,
             Mode::Normal => self.handle_normal_key(code)?,
         }
         Ok(())
     }
 
+    fn handle_search_key(&mut self, code: KeyCode) -> Result<()> {
+        let mut text = self.filter.search.take().unwrap_or_default();
+        match code {
+            // Enter keeps the search active; Esc clears it.
+            KeyCode::Enter => self.mode = Mode::Normal,
+            KeyCode::Esc => {
+                text.clear();
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Char(c) => text.push(c),
+            _ => {}
+        }
+        self.filter.search = (!text.is_empty()).then_some(text);
+        let selected_id = self.selected().map(|t| t.id);
+        self.reload(selected_id)
+    }
+
     /// Adds a new task, or updates `editing` with the form's values.
     fn save_form(&mut self, editing: Option<Task>, values: FormValues) -> Result<()> {
-        let verb = if editing.is_some() { "Updated" } else { "Added" };
-        let task = match editing {
-            None => self.db.add(&values.title, values.due, values.priority, &values.tags)?,
-            Some(task) => self.db.update(&Task {
-                title: values.title,
-                due: values.due,
-                priority: values.priority,
-                tags: values.tags,
-                ..task
-            })?,
+        let is_new = editing.is_none();
+        let base = editing.unwrap_or_else(|| Task::new(&values.title));
+        let task = Task {
+            title: values.title,
+            due: values.due,
+            priority: values.priority,
+            tags: values.tags,
+            repeat: values.repeat,
+            ..base
+        };
+        let (task, verb) = if is_new {
+            (self.db.add(&task)?, "Added")
+        } else {
+            (self.db.update(&task)?, "Updated")
         };
         self.message = Some(format!("{verb} task {}", task.id));
         self.reload(Some(task.id))
@@ -145,6 +172,7 @@ impl<'a> App<'a> {
             KeyCode::Down | KeyCode::Char('j') => self.table_state.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.table_state.select_previous(),
             KeyCode::Char('a') => self.mode = Mode::Form(Box::new(Form::new_task())),
+            KeyCode::Char('/') => self.mode = Mode::Search,
             KeyCode::Char('e') => {
                 if let Some(task) = self.selected() {
                     self.mode = Mode::Form(Box::new(Form::edit(task.clone())));
@@ -196,11 +224,17 @@ impl<'a> App<'a> {
             Constraint::Length(1),
             Constraint::Fill(1),
             Constraint::Length(8),
-            Constraint::Length(10),
+            Constraint::Length(12),
             Constraint::Length(20),
         ];
-        let hiding = if self.filter.pending_only { " · hiding done" } else { "" };
-        let title = format!(" todo · sort: {}{hiding} ", self.filter.sort.label());
+        let mut title = format!(" {} · sort: {}", self.db.list_name(), self.filter.sort.label());
+        if self.filter.pending_only {
+            title.push_str(" · hiding done");
+        }
+        if let Some(search) = &self.filter.search {
+            title.push_str(&format!(" · search: \"{search}\""));
+        }
+        title.push(' ');
         let table = Table::new(rows, widths)
             .header(header)
             .block(Block::bordered().title(title))
@@ -208,9 +242,13 @@ impl<'a> App<'a> {
             .highlight_symbol("› ");
         frame.render_stateful_widget(table, main, &mut self.table_state);
 
-        let footer_line = match &self.message {
-            Some(message) => Line::from(message.as_str()),
-            None => Line::from(HELP).dim(),
+        let footer_line = match (&self.mode, &self.message) {
+            (Mode::Search, _) => {
+                let text = self.filter.search.as_deref().unwrap_or("");
+                Line::from(format!("Search: {text}█  (Enter keep · Esc clear)"))
+            }
+            (_, Some(message)) => Line::from(message.as_str()),
+            (_, None) => Line::from(HELP).dim(),
         };
         frame.render_widget(Paragraph::new(footer_line), footer);
 
@@ -238,7 +276,7 @@ fn task_row(task: &Task, today: NaiveDate) -> Row<'static> {
         Cell::from(if task.done { "✓" } else { "" }).green(),
         Cell::from(task.title.clone()),
         Cell::from(task.priority.label()).fg(priority_color),
-        Cell::from(task.due.map(|d| d.to_string()).unwrap_or_default()).style(due_style),
+        Cell::from(task.due_label()).style(due_style),
         Cell::from(task.tags.join(", ")).cyan(),
     ]);
     if task.done {
@@ -253,18 +291,19 @@ fn task_row(task: &Task, today: NaiveDate) -> Row<'static> {
 // ---------------------------------------------------------------------------
 
 /// Label and input hint for each form field, in display order.
-const FIELDS: [(&str, &str); 4] = [
+const FIELDS: [(&str, &str); 5] = [
     ("Title", "What needs to be done"),
     ("Due", "YYYY-MM-DD, today, tomorrow or a weekday; empty for none"),
     ("Priority", "low, medium or high; empty for none"),
     ("Tags", "Comma separated, e.g. work, urgent"),
+    ("Repeat", "day, week, 2 weeks, monthly, ...; empty for none"),
 ];
 
 struct Form {
     /// `None` when adding a new task, otherwise the task being edited.
     editing: Option<Task>,
     /// The text in each field, in the same order as `FIELDS`.
-    fields: [String; 4],
+    fields: [String; 5],
     /// Index of the field that receives typed keys.
     focus: usize,
     error: Option<String>,
@@ -276,6 +315,7 @@ struct FormValues {
     due: Option<NaiveDate>,
     priority: Priority,
     tags: Vec<String>,
+    repeat: Option<Repeat>,
 }
 
 impl Form {
@@ -295,6 +335,7 @@ impl Form {
                 task.due.map(|d| d.to_string()).unwrap_or_default(),
                 task.priority.label().to_string(),
                 task.tags.join(", "),
+                task.repeat.map(|r| r.label()).unwrap_or_default(),
             ],
             editing: Some(task),
             focus: 0,
@@ -303,7 +344,7 @@ impl Form {
     }
 
     fn parse(&self) -> Result<FormValues, String> {
-        let [title, due, priority, tags] = &self.fields;
+        let [title, due, priority, tags, repeat] = &self.fields;
 
         let title = title.trim();
         if title.is_empty() {
@@ -324,14 +365,18 @@ impl Form {
             .filter(|tag| !tag.is_empty())
             .map(String::from)
             .collect();
+        let repeat = match repeat.trim() {
+            "" => None,
+            text => Some(task::parse_repeat(text)?),
+        };
 
-        Ok(FormValues { title: title.to_string(), due, priority, tags })
+        Ok(FormValues { title: title.to_string(), due, priority, tags, repeat })
     }
 
     fn draw(&self, frame: &mut Frame) {
         let heading = if self.editing.is_some() { " Edit task " } else { " New task " };
-        // 4 fields + blank line + hint + keys, plus 2 for the border.
-        let area = centered(frame.area(), 70, 9);
+        // 5 fields + blank line + hint + keys, plus 2 for the border.
+        let area = centered(frame.area(), 70, 10);
 
         let mut lines: Vec<Line> = FIELDS
             .iter()

@@ -7,10 +7,15 @@ use std::sync::mpsc;
 use anyhow::{Context, Result, anyhow, bail};
 use block2::RcBlock;
 use chrono::{Datelike, NaiveDate};
+use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
-use objc2_event_kit::{EKCalendar, EKEntityType, EKEventStore, EKReminder};
+use objc2_event_kit::{
+    EKCalendar, EKEntityType, EKEventStore, EKRecurrenceFrequency, EKRecurrenceRule, EKReminder,
+};
 use objc2_foundation::{NSArray, NSDateComponents, NSError, NSString};
+
+use crate::task::{Repeat, RepeatUnit};
 
 /// The fields of a reminder that this program reads and writes.
 pub struct ReminderData {
@@ -20,6 +25,7 @@ pub struct ReminderData {
     pub due: Option<NaiveDate>,
     /// EventKit's scale: 0 = none, 1–4 = high, 5 = medium, 6–9 = low.
     pub priority: usize,
+    pub repeat: Option<Repeat>,
 }
 
 pub struct Reminder {
@@ -27,6 +33,8 @@ pub struct Reminder {
     pub id: String,
     /// Creation time (seconds since 1970), used to number reminders in a stable order.
     pub created: f64,
+    /// Name of the list the reminder is in.
+    pub list: String,
     pub data: ReminderData,
 }
 
@@ -47,6 +55,10 @@ impl RemindersList {
             None => create_calendar(&store, name)?,
         };
         Ok(RemindersList { store, calendar })
+    }
+
+    pub fn name(&self) -> String {
+        unsafe { self.calendar.title() }.to_string()
     }
 
     /// All reminders in the list, completed ones included.
@@ -74,10 +86,20 @@ impl RemindersList {
         self.find(id).map(|r| to_reminder(&r))
     }
 
-    /// Creates a reminder and returns its EventKit identifier.
-    pub fn create(&self, data: &ReminderData) -> Result<String> {
+    /// Creates a reminder and returns its EventKit identifier. It goes in the
+    /// list called `list`, or in this list when `list` is `None`.
+    pub fn create(&self, data: &ReminderData, list: Option<&str>) -> Result<String> {
+        let calendar = match list {
+            Some(name) if name != self.name() => {
+                match find_calendar(&self.store, name) {
+                    Some(calendar) => calendar,
+                    None => create_calendar(&self.store, name)?,
+                }
+            }
+            _ => self.calendar.clone(),
+        };
         let reminder = unsafe { EKReminder::reminderWithEventStore(&self.store) };
-        unsafe { reminder.setCalendar(Some(&self.calendar)) };
+        unsafe { reminder.setCalendar(Some(&calendar)) };
         self.save(&reminder, data)?;
         Ok(unsafe { reminder.calendarItemIdentifier() }.to_string())
     }
@@ -116,6 +138,12 @@ impl RemindersList {
             if due_date(reminder) != data.due {
                 let components = data.due.map(date_components);
                 reminder.setDueDateComponents(components.as_deref());
+            }
+            // Same for the repeat rule, so more complex rules made on the
+            // iPhone (e.g. "every Monday and Thursday") aren't overwritten.
+            if repeat_of(reminder) != data.repeat {
+                let rules = data.repeat.map(|r| NSArray::from_retained_slice(&[recurrence_rule(r)]));
+                reminder.setRecurrenceRules(rules.as_deref());
             }
             self.store.saveReminder_commit_error(reminder, true).map_err(ns_error)
         }
@@ -164,14 +192,49 @@ fn to_reminder(reminder: &EKReminder) -> Reminder {
         Reminder {
             id: reminder.calendarItemIdentifier().to_string(),
             created: reminder.creationDate().map_or(0.0, |d| d.timeIntervalSince1970()),
+            list: reminder.calendar().map(|c| c.title().to_string()).unwrap_or_default(),
             data: ReminderData {
                 title: reminder.title().to_string(),
                 notes: reminder.notes().map(|n| n.to_string()).unwrap_or_default(),
                 done: reminder.isCompleted(),
                 due: due_date(reminder),
                 priority: reminder.priority(),
+                repeat: repeat_of(reminder),
             },
         }
+    }
+}
+
+/// The reminder's repeat rule. Only the first rule is used; Reminders itself
+/// only ever creates one.
+fn repeat_of(reminder: &EKReminder) -> Option<Repeat> {
+    let rules = unsafe { reminder.recurrenceRules() }?;
+    let rule = rules.iter().next()?;
+    let unit = match unsafe { rule.frequency() } {
+        EKRecurrenceFrequency::Daily => RepeatUnit::Day,
+        EKRecurrenceFrequency::Weekly => RepeatUnit::Week,
+        EKRecurrenceFrequency::Monthly => RepeatUnit::Month,
+        EKRecurrenceFrequency::Yearly => RepeatUnit::Year,
+        _ => return None,
+    };
+    let interval = u32::try_from(unsafe { rule.interval() }).unwrap_or(1).max(1);
+    Some(Repeat { unit, interval })
+}
+
+fn recurrence_rule(repeat: Repeat) -> Retained<EKRecurrenceRule> {
+    let frequency = match repeat.unit {
+        RepeatUnit::Day => EKRecurrenceFrequency::Daily,
+        RepeatUnit::Week => EKRecurrenceFrequency::Weekly,
+        RepeatUnit::Month => EKRecurrenceFrequency::Monthly,
+        RepeatUnit::Year => EKRecurrenceFrequency::Yearly,
+    };
+    unsafe {
+        EKRecurrenceRule::initRecurrenceWithFrequency_interval_end(
+            EKRecurrenceRule::alloc(),
+            frequency,
+            repeat.interval as isize,
+            None,
+        )
     }
 }
 

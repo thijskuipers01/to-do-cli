@@ -9,7 +9,7 @@ use clap::ValueEnum;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::reminders::{ReminderData, RemindersList};
-use crate::task::{Priority, Task};
+use crate::task::{self, Priority, Task};
 
 /// Tasks themselves live in the Reminders app. This local database only
 /// keeps what Reminders can't: short IDs and the undo history.
@@ -78,6 +78,10 @@ pub struct Filter {
     pub tag: Option<String>,
     pub priority: Option<Priority>,
     pub pending_only: bool,
+    /// Text that must appear in the title or notes (upper/lower case ignored).
+    pub search: Option<String>,
+    /// Only tasks due on or before this date.
+    pub due_by: Option<NaiveDate>,
     pub sort: SortKey,
 }
 
@@ -86,6 +90,12 @@ impl Filter {
         self.tag.as_ref().is_none_or(|tag| task.tags.contains(tag))
             && self.priority.is_none_or(|priority| task.priority == priority)
             && !(self.pending_only && task.done)
+            && self.search.as_ref().is_none_or(|text| {
+                let text = text.to_lowercase();
+                task.title.to_lowercase().contains(&text)
+                    || task.notes.to_lowercase().contains(&text)
+            })
+            && self.due_by.is_none_or(|by| task.due.is_some_and(|due| due <= by))
     }
 }
 
@@ -106,6 +116,11 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         let reminders = RemindersList::open(list_name)?;
         Ok(Store { conn, reminders })
+    }
+
+    /// Name of the Reminders list this store works on.
+    pub fn list_name(&self) -> String {
+        self.reminders.name()
     }
 
     pub fn list(&self, filter: &Filter) -> Result<Vec<Task>> {
@@ -129,7 +144,7 @@ impl Store {
                     id
                 }
             };
-            let task = to_task(id, reminder.data);
+            let task = to_task(id, reminder.list, reminder.data);
             if filter.matches(&task) {
                 tasks.push(task);
             }
@@ -142,26 +157,13 @@ impl Store {
         let Some(reminder_id) = self.reminder_id(id)? else {
             return Ok(None);
         };
-        Ok(self.reminders.get(&reminder_id).map(|r| to_task(id, r.data)))
+        Ok(self.reminders.get(&reminder_id).map(|r| to_task(id, r.list, r.data)))
     }
 
-    pub fn add(
-        &mut self,
-        title: &str,
-        due: Option<NaiveDate>,
-        priority: Priority,
-        tags: &[String],
-    ) -> Result<Task> {
-        let task = Task {
-            id: 0, // replaced below once the reminder exists
-            title: title.to_string(),
-            done: false,
-            due,
-            priority,
-            tags: tags.to_vec(),
-            notes: String::new(),
-        };
-        let reminder_id = self.reminders.create(&to_data(&task))?;
+    /// Saves `task` as a new reminder in this store's list and returns it
+    /// with its assigned ID. (`task.id` and `task.list` are ignored.)
+    pub fn add(&mut self, task: &Task) -> Result<Task> {
+        let reminder_id = self.reminders.create(&to_data(task), None)?;
         let id = self.assign_id(&reminder_id)?;
         self.record("add", id, None)?;
         self.get(id)?.context("the new reminder disappeared")
@@ -177,10 +179,11 @@ impl Store {
 
     pub fn set_done(&mut self, id: i64, done: bool) -> Result<Task> {
         let before = self.require(id)?;
-        let task = Task { done, ..before.clone() };
-        self.write(&task)?;
+        self.write(&Task { done, ..before.clone() })?;
         self.record(if done { "done" } else { "undone" }, id, Some(&before))?;
-        Ok(task)
+        // Read it back: completing a repeating task moves it to its next date
+        // (Reminders keeps a completed copy as a separate reminder).
+        self.require(id)
     }
 
     pub fn remove(&mut self, id: i64) -> Result<Task> {
@@ -226,14 +229,15 @@ impl Store {
                     self.reminders.delete(&reminder_id)?;
                 }
             }
-            // Put the task back as it was. If it was deleted, recreate it
-            // and point its short ID at the new reminder.
+            // Put the task back as it was. If it was deleted, recreate it in
+            // its original list and point its short ID at the new reminder.
             Some(json) => {
                 let task: Task = serde_json::from_str(&json).context("corrupt undo history")?;
                 match current {
                     Some(reminder_id) => self.reminders.update(&reminder_id, &to_data(&task))?,
                     None => {
-                        let reminder_id = self.reminders.create(&to_data(&task))?;
+                        let list = (!task.list.is_empty()).then_some(task.list.as_str());
+                        let reminder_id = self.reminders.create(&to_data(&task), list)?;
                         self.conn.execute(
                             "INSERT OR REPLACE INTO ids (id, reminder_id) VALUES (?1, ?2)",
                             params![task_id, reminder_id],
@@ -288,7 +292,7 @@ impl Store {
 // Any other text in the notes is kept in `Task::notes` and left untouched.
 // ---------------------------------------------------------------------------
 
-fn to_task(id: i64, data: ReminderData) -> Task {
+fn to_task(id: i64, list: String, data: ReminderData) -> Task {
     let (notes, tags) = split_notes(&data.notes);
     Task {
         id,
@@ -298,6 +302,8 @@ fn to_task(id: i64, data: ReminderData) -> Task {
         priority: Priority::from_eventkit(data.priority),
         tags,
         notes,
+        repeat: data.repeat,
+        list,
     }
 }
 
@@ -306,8 +312,10 @@ fn to_data(task: &Task) -> ReminderData {
         title: task.title.clone(),
         notes: join_notes(&task.notes, &task.tags),
         done: task.done,
-        due: task.due,
+        // A repeating reminder needs a date to repeat from; start today.
+        due: task.due.or(task.repeat.map(|_| task::today())),
         priority: task.priority.to_eventkit(),
+        repeat: task.repeat,
     }
 }
 

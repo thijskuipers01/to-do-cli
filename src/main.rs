@@ -6,19 +6,16 @@ mod task;
 mod tui;
 
 use std::env;
+use std::io;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 use store::{Filter, SortKey, Store};
-use task::Priority;
-
-/// The Reminders list that holds the tasks: `$TODO_LIST` if set, otherwise "Todo".
-fn list_name() -> String {
-    env::var("TODO_LIST").unwrap_or_else(|_| "Todo".to_string())
-}
+use task::{Priority, Repeat, Task};
 
 /// Where the local state (short IDs and undo history) lives: `$TODO_STATE` if
 /// set, otherwise `$XDG_DATA_HOME/todo/state.db`, which defaults to
@@ -39,8 +36,12 @@ fn state_path() -> Result<PathBuf> {
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "todo", version, about = "A simple command-line to-do manager")]
+#[command(name = "todo", version, about = "A to-do manager backed by Apple Reminders")]
 struct Cli {
+    /// Reminders list to use (created if it doesn't exist)
+    #[arg(short, long, global = true, env = "TODO_LIST", default_value = "Todo")]
+    list: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -60,8 +61,11 @@ enum Command {
         /// Tag to attach; repeat for more (-t work -t urgent)
         #[arg(short, long = "tag")]
         tags: Vec<String>,
+        /// Repeat the task: "day", "week", "2 weeks", "monthly", ... (starts today without --due)
+        #[arg(short, long, value_parser = task::parse_repeat)]
+        every: Option<Repeat>,
     },
-    /// Change the title, due date, priority or tags of a task
+    /// Change the title, due date, priority, tags or repeat of a task
     Edit {
         /// ID of the task
         id: i64,
@@ -83,6 +87,12 @@ enum Command {
         /// Tag to remove; repeat for more
         #[arg(long = "untag")]
         untags: Vec<String>,
+        /// New repeat interval (same formats as `add`)
+        #[arg(short, long, value_parser = task::parse_repeat, conflicts_with = "no_repeat")]
+        every: Option<Repeat>,
+        /// Stop repeating the task
+        #[arg(long)]
+        no_repeat: bool,
     },
     /// List tasks
     List {
@@ -92,12 +102,22 @@ enum Command {
         /// Only show tasks with this priority
         #[arg(short, long, value_enum)]
         priority: Option<Priority>,
+        /// Only show tasks whose title or notes contain this text
+        #[arg(long)]
+        search: Option<String>,
         /// Hide completed tasks
         #[arg(long)]
         pending: bool,
         /// Order of the list
         #[arg(short, long, value_enum, default_value_t = SortKey::Id)]
         sort: SortKey,
+    },
+    /// Show unfinished tasks that are overdue or due today
+    Today,
+    /// Show all details of a task, including its notes
+    Show {
+        /// ID of the task
+        id: i64,
     },
     /// Mark a task as done
     Done {
@@ -115,6 +135,10 @@ enum Command {
     Tui,
     /// Show a desktop notification for unfinished tasks due tomorrow
     Notify,
+    /// Print a shell completion script (e.g. `todo completions zsh`)
+    Completions {
+        shell: Shell,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -123,20 +147,29 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut db = Store::open(&state_path()?, &list_name())?;
+
+    // Completions don't need Reminders, so handle them before asking for access.
+    if let Command::Completions { shell } = cli.command {
+        clap_complete::generate(shell, &mut Cli::command(), "todo", &mut io::stdout());
+        return Ok(());
+    }
+
+    let mut db = Store::open(&state_path()?, &cli.list)?;
 
     match cli.command {
-        Command::Add { title, due, priority, tags } => {
-            let task = db.add(&title, due, priority, &tags)?;
+        Command::Add { title, due, priority, tags, every } => {
+            let task = db.add(&Task { due, priority, tags, repeat: every, ..Task::new(&title) })?;
             println!("Added task {}: {}", task.id, task.title);
         }
-        Command::Edit { id, title, due, no_due, priority, tags, untags } => {
+        Command::Edit { id, title, due, no_due, priority, tags, untags, every, no_repeat } => {
             if title.is_none()
                 && due.is_none()
                 && !no_due
                 && priority.is_none()
                 && tags.is_empty()
                 && untags.is_empty()
+                && every.is_none()
+                && !no_repeat
             {
                 bail!("nothing to change; see `todo edit --help` for the options");
             }
@@ -155,17 +188,45 @@ fn main() -> Result<()> {
             }
             task.tags.retain(|tag| !untags.contains(tag));
             task.tags.extend(tags);
+            if no_repeat {
+                task.repeat = None;
+            } else if every.is_some() {
+                task.repeat = every;
+            }
 
             let task = db.update(&task)?;
             println!("Updated task {id}: {}", task.title);
         }
-        Command::List { tag, priority, pending, sort } => {
-            let filter = Filter { tag, priority, pending_only: pending, sort };
+        Command::List { tag, priority, search, pending, sort } => {
+            let filter = Filter { tag, priority, search, pending_only: pending, sort, ..Filter::default() };
             display::print_tasks(&db.list(&filter)?);
+        }
+        Command::Today => {
+            let filter = Filter {
+                pending_only: true,
+                due_by: Some(task::today()),
+                sort: SortKey::Due,
+                ..Filter::default()
+            };
+            let tasks = db.list(&filter)?;
+            if tasks.is_empty() {
+                println!("Nothing overdue or due today.");
+            } else {
+                display::print_tasks(&tasks);
+            }
+        }
+        Command::Show { id } => {
+            let task = db.get(id)?.with_context(|| format!("no task with id {id}"))?;
+            display::print_task_details(&task);
         }
         Command::Done { id } => {
             let task = db.set_done(id, true)?;
-            println!("Completed task {id}: {}", task.title);
+            match (task.done, task.due) {
+                (false, Some(next)) => {
+                    println!("Completed task {id}: {} (repeats, next due {next})", task.title)
+                }
+                _ => println!("Completed task {id}: {}", task.title),
+            }
         }
         Command::Remove { id } => {
             let task = db.remove(id)?;
@@ -177,6 +238,7 @@ fn main() -> Result<()> {
         },
         Command::Tui => tui::run(&mut db)?,
         Command::Notify => notify::due_tomorrow(&db)?,
+        Command::Completions { .. } => unreachable!("handled above"),
     }
 
     Ok(())
