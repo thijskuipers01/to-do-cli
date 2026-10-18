@@ -1,17 +1,16 @@
 //! The pop-up form for adding and editing a task.
 
-use chrono::NaiveDate;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
-use todo::model::{self, Priority, Repeat, Task};
+use todo::model::{self, Due, Priority, Repeat, Task};
 
 /// Label and input hint for each form field, in display order.
 pub(super) const FIELDS: [(&str, &str); 5] = [
     ("Title", "What needs to be done"),
-    ("Due", "YYYY-MM-DD, today, tomorrow or a weekday; empty for none"),
+    ("Due", "friday, 2026-10-23, tomorrow 15:00, ...; empty for none"),
     ("Priority", "low, medium or high; empty for none"),
     ("Tags", "Comma separated, e.g. work, urgent"),
     ("Repeat", "day, week, 2 weeks, monthly, ...; empty for none"),
@@ -30,7 +29,7 @@ pub(super) struct Form {
 /// The form's fields after checking and converting the typed text.
 pub(super) struct FormValues {
     pub title: String,
-    pub due: Option<NaiveDate>,
+    pub due: Option<Due>,
     pub priority: Priority,
     pub tags: Vec<String>,
     pub repeat: Option<Repeat>,
@@ -50,7 +49,7 @@ impl Form {
         Form {
             fields: [
                 task.title.clone(),
-                task.due.map(|d| d.to_string()).unwrap_or_default(),
+                task.due_text(),
                 task.priority.label().to_string(),
                 task.tags.join(", "),
                 task.repeat.map(|r| r.label()).unwrap_or_default(),
@@ -70,7 +69,7 @@ impl Form {
         }
         let due = match due.trim() {
             "" => None,
-            text => Some(model::parse_due(text)?),
+            text => Some(model::parse_due_time(text)?),
         };
         let priority = match priority.trim() {
             "" => Priority::None,
@@ -158,21 +157,23 @@ mod tests {
     fn edit_form_is_filled_from_the_task() {
         let task = Task {
             due: Some("2026-10-20".parse().unwrap()),
+            due_time: Some("15:00:00".parse().unwrap()),
             priority: Priority::High,
             tags: vec!["a".into(), "b".into()],
             repeat: Some(Repeat { unit: RepeatUnit::Week, interval: 2 }),
             ..Task::new("Title")
         };
         let form = Form::edit(task);
-        assert_eq!(form.fields, ["Title", "2026-10-20", "high", "a, b", "every 2 weeks"]);
+        assert_eq!(form.fields, ["Title", "2026-10-20 15:00", "high", "a, b", "every 2 weeks"]);
         assert!(form.editing.is_some());
     }
 
     #[test]
     fn parses_valid_input() {
-        let values = form([" Milk ", "2026-10-20", "HIGH", "home, , shop ", "2 weeks"]).parse().unwrap();
+        let values = form([" Milk ", "2026-10-20 15:00", "HIGH", "home, , shop ", "2 weeks"]).parse().unwrap();
         assert_eq!(values.title, "Milk");
-        assert_eq!(values.due, Some("2026-10-20".parse().unwrap()));
+        let due = Due { date: "2026-10-20".parse().unwrap(), time: Some("15:00:00".parse().unwrap()) };
+        assert_eq!(values.due, Some(due));
         assert_eq!(values.priority, Priority::High);
         assert_eq!(values.tags, ["home", "shop"]);
         assert_eq!(values.repeat, Some(Repeat { unit: RepeatUnit::Week, interval: 2 }));
@@ -188,7 +189,7 @@ mod tests {
     #[test]
     fn explains_invalid_input() {
         assert_eq!(form(["  ", "", "", "", ""]).parse().err().unwrap(), "Title can't be empty");
-        assert!(form(["a", "someday", "", "", ""]).parse().err().unwrap().contains("YYYY-MM-DD"));
+        assert!(form(["a", "someday", "", "", ""]).parse().err().unwrap().contains("YYYY-MM-DD"), "dates are explained");
         assert_eq!(
             form(["a", "", "urgent", "", ""]).parse().err().unwrap(),
             "Priority must be none, low, medium or high"

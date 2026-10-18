@@ -28,7 +28,8 @@ $ todo list --pending --sort due
 - **Multiple lists** (`--list Shopping`)
 - A macOS **notification** for tasks due tomorrow
 - **Tab completion** for zsh, bash and fish
-- **JSON output** (`--json`) for scripts and AI assistants
+- **JSON output** (`--json`) for scripts and AI assistants, and a
+  [Claude Code skill](skills/todo/SKILL.md) that teaches agents to use it
 
 ## Requirements
 
@@ -74,16 +75,25 @@ history as well.
 ```sh
 todo add "Buy milk"                                  # just a title
 todo add "Report" -d friday -p high -t work          # due date, priority, tag
+todo add "Call mum" --due "friday 15:00"             # due time, with an alert
 todo add "Water plants" --every week                 # repeating, starts today
 todo list                                            # everything
 todo list --pending --sort due                       # open tasks, soonest first
 todo list --tag work --search report                 # filter and search
+todo list --due-after today --due-before sunday      # due this week
+todo list --overdue                                  # unfinished and past due
 todo today                                           # overdue or due today
 todo show 3                                          # all details, including notes
 todo edit 3 --title "Final report" -d 2026-11-01     # change fields
 todo edit 3 -t urgent --untag work --no-repeat       # tags and repeat
+todo add "Dentist" --notes "Bring insurance card"    # notes
+todo edit 3 --append-notes "Booked by phone"         # add a line to the notes
 todo done 3
+todo done 3 5 7                                      # several at once
 todo remove 3
+todo edit 3 --due monday --dry-run                   # show the result, change nothing
+todo lists                                           # which Reminders lists exist
+todo history                                         # recent changes, newest first
 todo undo                                            # repeat to go further back
 todo tui                                             # interactive mode
 ```
@@ -94,13 +104,15 @@ Run `todo --help` or `todo <command> --help` for every option.
 
 | Command | What it does |
 |---|---|
-| `add <title>` | Add a task. Options: `-d/--due`, `-p/--priority`, `-t/--tag` (repeatable), `-e/--every` |
-| `list` | List tasks. Options: `-t/--tag`, `-p/--priority`, `--search`, `--pending`, `-s/--sort id\|due\|priority` |
+| `add <title>` | Add a task. Options: `-d/--due`, `-p/--priority`, `-t/--tag` (repeatable), `-e/--every`, `--notes` |
+| `list` | List tasks. Options: `-t/--tag`, `-p/--priority`, `--search`, `--pending`, `--due-before <date>`, `--due-after <date>` (both inclusive), `--overdue` (unfinished, due before today), `--no-due` (no due date), `-s/--sort id\|due\|priority` |
 | `today` | Unfinished tasks that are overdue or due today |
 | `show <id>` | Every detail of one task, including its notes |
-| `edit <id>` | Change a task: `--title`, `-d/--due`, `--no-due`, `-p/--priority`, `-t/--tag`, `--untag`, `-e/--every`, `--no-repeat` |
-| `done <id>` | Mark a task as done |
-| `remove <id>` | Delete a task |
+| `edit <id>` | Change a task: `--title`, `-d/--due`, `--no-due`, `-p/--priority`, `-t/--tag`, `--untag`, `-e/--every`, `--no-repeat`, `--notes`, `--no-notes`, `--append-notes`, `--dry-run` |
+| `done <id>...` | Mark one or more tasks as done. Option: `--dry-run` |
+| `remove <id>...` | Delete one or more tasks. Option: `--dry-run` |
+| `lists` | All Reminders lists, with the number of unfinished tasks in each |
+| `history` | The most recent changes that `undo` can revert, newest first. Option: `-n/--limit` (default 10) |
 | `undo` | Undo the last change; repeat to go further back |
 | `tui` | Open the terminal UI |
 | `notify` | Show a macOS notification for tasks due tomorrow |
@@ -113,9 +125,15 @@ Every command also accepts `-l/--list <name>` to work on another Reminders list.
 Add `--json` to get machine-readable output, for scripts or an AI assistant
 that manages your tasks through `todo`. `list` and `today` print an array of
 tasks, `show` prints one task, and `add`, `edit`, `done` and `remove` print the
-task they changed (so you get the ID of a new task back). `undo` prints
+task they changed (so you get the ID of a new task back); `done` and `remove`
+with several IDs print an array. `undo` prints
 `{"undone": "..."}`, or `{"undone": null}` when there is nothing to undo.
-Errors still go to stderr with a non-zero exit code.
+`history` prints `[{"action": "done", "id": 3, "title": "Milk", "at":
+"2026-10-18T14:03:00+02:00", "batch": 2}, ...]`, newest first; changes with
+the same `batch` came from one command and one `undo` reverts them all
+(`at` is `null` for changes made before `todo` recorded times).
+`lists` prints `[{"name": "Todo", "open": 4}, ...]`; use it to find the right
+list name, since `--list` creates a list that doesn't exist yet.
 
 ```sh
 $ todo add "Dentist" --due friday --priority high --tag health --json
@@ -124,6 +142,7 @@ $ todo add "Dentist" --due friday --priority high --tag health --json
   "title": "Dentist",
   "done": false,
   "due": "2026-10-23",
+  "due_time": null,
   "priority": "high",
   "tags": [
     "health"
@@ -137,11 +156,48 @@ $ todo add "Dentist" --due friday --priority high --tag health --json
 Values use the same words as the options (`"high"`, `"every 2 weeks"`), so
 they can be passed straight back to `add` or `edit`. Empty fields are `null`.
 
+Errors go to stderr as JSON too, with an exit code per kind of error:
+
+```sh
+$ todo show 7 --json
+{"error":"not_found","message":"no task with id 7"}
+$ echo $?
+3
+```
+
+| `error` | Exit code | When |
+|---|---|---|
+| `invalid_input` | 2 | a bad date or priority, an unknown option, `edit` with nothing to change |
+| `not_found` | 3 | no task with that ID |
+| `permission_denied` | 4 | no access to Reminders |
+| `other` | 1 | anything else |
+
+Without `--json`, errors are printed as plain text (`Error: no task with id 7`)
+with exit code 1, or 2 for a mistake in the options.
+
+### Using it from Claude Code
+
+The repository includes a [skill](skills/todo/SKILL.md) that teaches Claude
+Code (and other agents that read `SKILL.md` files) to manage your tasks with
+`todo --json`, instead of scripting the Reminders app. It explains the
+commands, the input formats, to look up IDs and list names before changing
+anything, and `--dry-run` and `undo`. Install it for all your projects:
+
+```sh
+mkdir -p ~/.claude/skills
+cp -r skills/todo ~/.claude/skills/
+```
+
+Or, to use it in one project only, copy it to that project's
+`.claude/skills/` folder. Then ask things like "what's due this week?" or
+"add milk to my shopping list". Copy it again after updating `todo`.
+
 ### Input formats
 
 | What | Accepted values |
 |---|---|
 | Due date | `2026-10-20`, `today`, `tomorrow`, or a weekday such as `friday`/`fri` (the next one after today) |
+| Due time (optional) | after the date: `friday 15:00`, `tomorrow 3pm`, `2026-10-23 9:30am`, `2026-10-23T15:00`; a time alone (`15:00`) means today |
 | Priority | `none` (default), `low`, `medium`, `high` |
 | Repeat | `day`, `week`, `month`, `year`, optionally with a number and/or "every": `2 weeks`, `every 3 days`, `monthly` |
 
@@ -180,10 +236,28 @@ undo history is lost.
 for example `#work #urgent`, because Apple doesn't let other apps read or set
 Reminders' own tags. You can see and edit that line on your phone. Tags added
 with the Reminders tag feature itself aren't visible to `todo`. Any other text
-in the notes is left untouched.
+in the notes is left untouched, and `--notes`, `--no-notes` and
+`--append-notes` change only that other text, never the hashtag line. Notes can
+only be set from the command line; the terminal UI form has no notes field.
 
 **Priorities** map to the ones in Reminders: high shows as `!!!`, medium as
 `!!` and low as `!` on your phone.
+
+**Dry runs.** `edit`, `done` and `remove` take `--dry-run`: they print the
+task(s) as they would be after the change (for `done` on a repeating task,
+with its next due date), in the same form as without it and also with
+`--json`, but nothing is saved and nothing is added to the undo history.
+Invalid input and unknown IDs are still reported as errors.
+
+**Several IDs.** `done` and `remove` accept several IDs. All of them are
+checked first: if one doesn't exist, nothing is changed. One `undo` reverts
+the whole command.
+
+**Due times.** A task with a time (`--due "friday 15:00"`) also gets an
+alert at that time in Reminders, so your iPhone notifies you. Changing the
+due time moves the alert; giving only a date (`--due friday`) makes the task
+all-day again. In JSON the time is a separate field, `"due_time": "15:00"`
+(`null` for all-day tasks), next to `"due"`.
 
 **Repeating tasks** work like they do in Reminders: completing one moves it to
 its next date and keeps a completed copy as a record. A repeating task needs a
@@ -216,7 +290,6 @@ automatically, schedule `todo notify` with launchd.
 ## Limitations
 
 - macOS only. EventKit, the Reminders framework, doesn't exist elsewhere.
-- Due dates are whole days; a time of day set on the iPhone is kept but not shown.
 - Undoing a change overwrites edits made to that task on another device in
   the meantime. Undoing the completion of a repeating task leaves its completed
   copy in place.
@@ -263,6 +336,7 @@ sync to iCloud briefly) and delete them afterwards. They need Reminders access.
 ```
 src/
 ├── lib.rs                 library entry point and public API
+├── error.rs               Error, ErrorKind
 ├── model/                 data types, no storage
 │   ├── task.rs            Task, DueStatus
 │   ├── priority.rs        Priority
@@ -286,4 +360,6 @@ src/
         └── form.rs        the add/edit form
 tests/
 └── library.rs             uses the library through its public API only
+skills/
+└── todo/SKILL.md          teaches AI agents to use `todo`
 ```

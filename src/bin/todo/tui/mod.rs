@@ -152,7 +152,8 @@ impl<'a, B: Backend> App<'a, B> {
         let base = editing.unwrap_or_else(|| Task::new(&values.title));
         let task = Task {
             title: values.title,
-            due: values.due,
+            due: values.due.map(|d| d.date),
+            due_time: values.due.and_then(|d| d.time),
             priority: values.priority,
             tags: values.tags,
             repeat: values.repeat,

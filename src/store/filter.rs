@@ -17,14 +17,15 @@ pub enum SortKey {
 impl SortKey {
     /// Sorts `tasks` in place. Ties are broken so the order is always the same.
     pub fn sort(self, tasks: &mut [Task]) {
-        // `(due.is_none(), due)` puts tasks without a due date last.
+        // `(due.is_none(), due)` puts tasks without a due date last. On the same
+    // day, all-day tasks (no time) come before timed ones.
         match self {
             SortKey::Id => tasks.sort_by_key(|t| t.id),
             SortKey::Due => {
-                tasks.sort_by_key(|t| (t.due.is_none(), t.due, Reverse(t.priority), t.id))
+                tasks.sort_by_key(|t| (t.due.is_none(), t.due, t.due_time, Reverse(t.priority), t.id))
             }
             SortKey::Priority => {
-                tasks.sort_by_key(|t| (Reverse(t.priority), t.due.is_none(), t.due, t.id))
+                tasks.sort_by_key(|t| (Reverse(t.priority), t.due.is_none(), t.due, t.due_time, t.id))
             }
         }
     }
@@ -58,6 +59,10 @@ pub struct Filter {
     pub search: Option<String>,
     /// Only tasks due on or before this date.
     pub due_by: Option<NaiveDate>,
+    /// Only tasks due on or after this date.
+    pub due_after: Option<NaiveDate>,
+    /// Only tasks without a due date.
+    pub no_due: bool,
     pub sort: SortKey,
 }
 
@@ -73,6 +78,8 @@ impl Filter {
                     || task.notes.to_lowercase().contains(&text)
             })
             && self.due_by.is_none_or(|by| task.due.is_some_and(|due| due <= by))
+            && self.due_after.is_none_or(|after| task.due.is_some_and(|due| due >= after))
+            && !(self.no_due && task.due.is_some())
     }
 }
 
@@ -128,6 +135,26 @@ mod tests {
     fn due_by_needs_a_due_date_on_or_before_the_day() {
         assert_eq!(matching(&Filter { due_by: Some(date("2026-10-18")), ..all() }), [3, 4]);
         assert_eq!(matching(&Filter { due_by: Some(date("2026-10-17")), ..all() }), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn due_after_needs_a_due_date_on_or_after_the_day() {
+        assert_eq!(matching(&Filter { due_after: Some(date("2026-10-18")), ..all() }), [1, 3, 4]);
+        assert_eq!(matching(&Filter { due_after: Some(date("2026-10-19")), ..all() }), [1]);
+    }
+
+    #[test]
+    fn date_range_is_inclusive_on_both_ends() {
+        let range = Filter { due_after: Some(date("2026-10-18")), due_by: Some(date("2026-10-18")), ..all() };
+        assert_eq!(matching(&range), [3, 4]);
+        let pending_range = Filter { pending_only: true, tag: Some("work".into()), ..range };
+        assert_eq!(matching(&pending_range), [4]);
+    }
+
+    #[test]
+    fn no_due_keeps_only_undated_tasks() {
+        assert_eq!(matching(&Filter { no_due: true, ..all() }), [2]);
+        assert_eq!(matching(&Filter { no_due: true, priority: Some(Priority::Low), ..all() }), Vec::<i64>::new());
     }
 
     #[test]

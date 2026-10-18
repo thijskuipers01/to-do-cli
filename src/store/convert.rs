@@ -14,6 +14,7 @@ pub(super) fn to_task(id: i64, list: String, data: ReminderData) -> Task {
         title: data.title,
         done: data.done,
         due: data.due,
+        due_time: data.due.and(data.due_time),
         priority: Priority::from_eventkit(data.priority),
         tags,
         notes,
@@ -29,6 +30,7 @@ pub(super) fn to_data(task: &Task) -> ReminderData {
         done: task.done,
         // A repeating reminder needs a date to repeat from; start today.
         due: task.due.or(task.repeat.map(|_| model::today())),
+        due_time: task.due.and(task.due_time),
         priority: task.priority.to_eventkit(),
         repeat: task.repeat,
     }
@@ -117,6 +119,7 @@ mod tests {
         let task = Task {
             id: 3,
             due: Some(date("2026-10-20")),
+            due_time: Some("15:30:00".parse().unwrap()),
             priority: Priority::High,
             tags: tags(&["work"]),
             notes: "Bring slides".into(),
@@ -130,6 +133,12 @@ mod tests {
 
         let back = to_task(3, "Todo".into(), data);
         assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&task).unwrap());
+    }
+
+    #[test]
+    fn a_time_without_a_date_is_dropped() {
+        let task = Task { due_time: Some("15:00:00".parse().unwrap()), ..Task::new("a") };
+        assert_eq!(to_data(&task).due_time, None);
     }
 
     #[test]

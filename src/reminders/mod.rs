@@ -5,7 +5,7 @@ mod eventkit;
 mod memory;
 
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 
 use crate::model::Repeat;
 pub use eventkit::RemindersList;
@@ -18,6 +18,8 @@ pub struct ReminderData {
     pub notes: String,
     pub done: bool,
     pub due: Option<NaiveDate>,
+    /// Time of day the reminder is due; `None` for an all-day reminder.
+    pub due_time: Option<NaiveTime>,
     /// EventKit's scale: 0 = none, 1–4 = high, 5 = medium, 6–9 = low.
     pub priority: usize,
     pub repeat: Option<Repeat>,
@@ -31,6 +33,7 @@ impl ReminderData {
             notes: String::new(),
             done: false,
             due: None,
+            due_time: None,
             priority: 0,
             repeat: None,
         }
@@ -49,6 +52,24 @@ pub struct Reminder {
     pub data: ReminderData,
 }
 
+/// A reminders list and how many unfinished reminders it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListSummary {
+    pub name: String,
+    pub open: usize,
+}
+
+/// Counts the unfinished reminders per list. Every name in `names` is
+/// included, also those without any; the result is sorted by name.
+fn summarize<'a>(names: impl IntoIterator<Item = String>, open: impl IntoIterator<Item = &'a Reminder>) -> Vec<ListSummary> {
+    let mut counts: std::collections::BTreeMap<String, usize> =
+        names.into_iter().map(|name| (name, 0)).collect();
+    for reminder in open {
+        *counts.entry(reminder.list.clone()).or_default() += 1;
+    }
+    counts.into_iter().map(|(name, open)| ListSummary { name, open }).collect()
+}
+
 /// What a [`Store`](crate::Store) needs from a reminders list.
 pub trait Backend {
     /// Name of the list.
@@ -62,4 +83,6 @@ pub trait Backend {
     fn update(&self, id: &str, data: &ReminderData) -> Result<()>;
     /// Deletes a reminder. Does nothing if it's already gone.
     fn delete(&self, id: &str) -> Result<()>;
+    /// Every list that exists, not only this one, sorted by name.
+    fn lists(&self) -> Result<Vec<ListSummary>>;
 }

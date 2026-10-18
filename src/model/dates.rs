@@ -1,4 +1,4 @@
-use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
+use chrono::{Datelike, Days, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 
 /// Today's date in the local time zone.
 pub fn today() -> NaiveDate {
@@ -21,6 +21,67 @@ pub fn parse_due(input: &str) -> Result<NaiveDate, String> {
             })
         }
     }
+}
+
+/// A due date with an optional time of day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Due {
+    pub date: NaiveDate,
+    pub time: Option<NaiveTime>,
+}
+
+/// Parses a due date with an optional time: anything [`parse_due`] accepts,
+/// optionally followed by a time (`friday 15:00`, `tomorrow at 3pm`), an
+/// ISO date and time (`2026-10-23T15:00`), or only a time, meaning today.
+pub fn parse_due_time(input: &str) -> Result<Due, String> {
+    let error = || {
+        format!(
+            "expected a date (YYYY-MM-DD, \"today\", \"tomorrow\" or a weekday), \
+             optionally followed by a time (15:00, 3pm), got \"{input}\""
+        )
+    };
+    let text = input.trim().to_lowercase().replace(" am", "am").replace(" pm", "pm");
+    if let Ok(date) = parse_due(&text) {
+        return Ok(Due { date, time: None });
+    }
+    if let Some(time) = parse_time(&text) {
+        return Ok(Due { date: today(), time: Some(time) });
+    }
+    for format in ["%Y-%m-%dt%H:%M", "%Y-%m-%dt%H:%M:%S"] {
+        if let Ok(at) = NaiveDateTime::parse_from_str(&text, format) {
+            return Ok(Due { date: at.date(), time: Some(at.time()) });
+        }
+    }
+    let (date, time) = text.rsplit_once(' ').ok_or_else(error)?;
+    let date = date.trim_end().strip_suffix(" at").unwrap_or(date);
+    Ok(Due {
+        date: parse_due(date).map_err(|_| error())?,
+        time: Some(parse_time(time).ok_or_else(error)?),
+    })
+}
+
+/// "15:00", "9:30", "3pm", "3:30pm" (lowercase, no spaces).
+fn parse_time(text: &str) -> Option<NaiveTime> {
+    let (clock, afternoon) = match (text.strip_suffix("am"), text.strip_suffix("pm")) {
+        (Some(clock), _) => (clock, Some(false)),
+        (_, Some(clock)) => (clock, Some(true)),
+        _ => (text, None),
+    };
+    let (hour, minute) = clock.split_once(':').unwrap_or((clock, "00"));
+    let all_digits = |s: &str| (1..=2).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
+    if !all_digits(hour) || minute.len() != 2 || !all_digits(minute) {
+        return None;
+    }
+    let (mut hour, minute): (u32, u32) = (hour.parse().ok()?, minute.parse().ok()?);
+    match afternoon {
+        // "3pm" is 15:00, "12pm" noon and "12am" midnight.
+        Some(pm) if (1..=12).contains(&hour) => hour = hour % 12 + if pm { 12 } else { 0 },
+        Some(_) => return None,
+        // A bare number without ":" or am/pm is not a time.
+        None if !clock.contains(':') => return None,
+        None => {}
+    }
+    NaiveTime::from_hms_opt(hour, minute, 0)
 }
 
 /// The first `weekday` strictly after `from` (so "friday" on a Friday is next week).
@@ -59,6 +120,32 @@ mod tests {
     fn parse_due_rejects_invalid_dates() {
         for input in ["", "2026-13-01", "2026-02-30", "31-12-2026", "someday"] {
             assert!(parse_due(input).is_err(), "should reject {input:?}");
+        }
+    }
+
+    fn at(date: NaiveDate, time: &str) -> Due {
+        Due { date, time: Some(time.parse().unwrap()) }
+    }
+
+    #[test]
+    fn parse_due_time_accepts_dates_with_and_without_times() {
+        let day = date("2026-10-23");
+        assert_eq!(parse_due_time("2026-10-23"), Ok(Due { date: day, time: None }));
+        assert_eq!(parse_due_time("2026-10-23T15:00"), Ok(at(day, "15:00:00")));
+        assert_eq!(parse_due_time("2026-10-23 9:30"), Ok(at(day, "09:30:00")));
+        assert_eq!(parse_due_time("2026-10-23 at 3pm"), Ok(at(day, "15:00:00")));
+        assert_eq!(parse_due_time("2026-10-23 3:30 PM"), Ok(at(day, "15:30:00")));
+        assert_eq!(parse_due_time("tomorrow 12am"), Ok(at(today() + Days::new(1), "00:00:00")));
+        assert_eq!(parse_due_time("12pm"), Ok(at(today(), "12:00:00")));
+        assert_eq!(parse_due_time("today 23:59"), Ok(at(today(), "23:59:00")));
+        let friday = parse_due_time("Friday 15:00").unwrap();
+        assert_eq!((friday.date.weekday(), friday.time), (Weekday::Fri, at(day, "15:00:00").time));
+    }
+
+    #[test]
+    fn parse_due_time_rejects_bad_times() {
+        for input in ["friday 25:00", "friday 15", "friday 13pm", "friday 0am", "15:0", "someday 15:00", "", "friday at"] {
+            assert!(parse_due_time(input).is_err(), "should reject {input:?}");
         }
     }
 
