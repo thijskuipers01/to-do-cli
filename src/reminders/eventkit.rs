@@ -131,6 +131,16 @@ impl Backend for RemindersList {
     fn lists(&self) -> Result<Vec<ListSummary>> {
         list_summaries(&self.store)
     }
+
+    fn select_list(&mut self, name: &str) -> Result<()> {
+        if name != self.name() {
+            self.calendar = match find_calendar(&self.store, name) {
+                Some(calendar) => calendar,
+                None => create_calendar(&self.store, name)?,
+            };
+        }
+        Ok(())
+    }
 }
 
 /// Fetches the reminders matching `predicate`. EventKit answers on a

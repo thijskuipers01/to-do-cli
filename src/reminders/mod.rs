@@ -85,4 +85,7 @@ pub trait Backend {
     fn delete(&self, id: &str) -> Result<()>;
     /// Every list that exists, not only this one, sorted by name.
     fn lists(&self) -> Result<Vec<ListSummary>>;
+    /// Makes the list called `name` the current one, creating it if it
+    /// doesn't exist.
+    fn select_list(&mut self, name: &str) -> Result<()>;
 }

@@ -1,6 +1,6 @@
 use std::cmp::Reverse;
 
-use chrono::NaiveDate;
+use chrono::{Days, NaiveDate};
 
 use crate::model::{Priority, Task};
 
@@ -67,6 +67,13 @@ pub struct Filter {
 }
 
 impl Filter {
+    /// Narrows the filter to unfinished tasks due before `today`.
+    pub fn only_overdue(&mut self, today: NaiveDate) {
+        let yesterday = today - Days::new(1);
+        self.pending_only = true;
+        self.due_by = Some(self.due_by.map_or(yesterday, |by| by.min(yesterday)));
+    }
+
     /// Whether `task` passes every condition of the filter.
     pub fn matches(&self, task: &Task) -> bool {
         self.tag.as_ref().is_none_or(|tag| task.tags.contains(tag))
@@ -155,6 +162,19 @@ mod tests {
     fn no_due_keeps_only_undated_tasks() {
         assert_eq!(matching(&Filter { no_due: true, ..all() }), [2]);
         assert_eq!(matching(&Filter { no_due: true, priority: Some(Priority::Low), ..all() }), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn only_overdue_keeps_unfinished_tasks_before_today() {
+        let mut filter = all();
+        filter.only_overdue(date("2026-10-19"));
+        assert_eq!(matching(&filter), [4], "3 is overdue too, but done");
+        let mut filter = all();
+        filter.only_overdue(date("2026-10-21"));
+        assert_eq!(matching(&filter), [1, 4]);
+        let mut earlier = Filter { due_by: Some(date("2026-10-18")), ..all() };
+        earlier.only_overdue(date("2026-10-21"));
+        assert_eq!(matching(&earlier), [4], "an earlier due_by wins");
     }
 
     #[test]

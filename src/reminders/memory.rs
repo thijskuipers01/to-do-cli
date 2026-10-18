@@ -89,6 +89,11 @@ impl Backend for MemoryList {
         Ok(())
     }
 
+    fn select_list(&mut self, name: &str) -> Result<()> {
+        self.switch_to(name);
+        Ok(())
+    }
+
     /// The current list and every list that holds a reminder.
     fn lists(&self) -> Result<Vec<ListSummary>> {
         let reminders = self.reminders.borrow();

@@ -15,10 +15,19 @@ path = "src/bin/todo/main.rs"
 required-features = ["cli"]
 doc = false # the library has the same name; document only the library
 
+# The MCP server for AI assistants. Install with `--features mcp`.
+[[bin]]
+name = "todo-mcp"
+path = "src/bin/todo-mcp/main.rs"
+required-features = ["mcp"]
+doc = false
+
 [features]
 default = ["cli"]
 # Everything the `todo` program needs on top of the library.
 cli = ["dep:clap", "dep:clap_complete", "dep:comfy-table", "dep:ratatui"]
+# The `todo-mcp` server. It needs nothing beyond the library.
+mcp = []
 
 [dependencies]
 anyhow = "1.0.104"

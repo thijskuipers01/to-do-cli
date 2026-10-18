@@ -13,6 +13,10 @@ app with AppleScript, `osascript` or Shortcuts instead.
 If `todo` isn't installed (`command -v todo` finds nothing), tell the user
 and point them to the README; don't fall back to AppleScript.
 
+If the `todo` MCP tools are available (`list_tasks`, `add_task`,
+`update_task`, ...), use those instead of the shell; they take the same
+formats, return the same JSON, and the advice below applies to them too.
+
 ## Read before you write
 
 - Tasks are identified by a short number, the `id`. **Never guess an ID.**

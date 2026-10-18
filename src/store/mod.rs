@@ -6,7 +6,8 @@ mod filter;
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::env;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, TimeZone};
@@ -48,6 +49,20 @@ CREATE TABLE IF NOT EXISTS history (
 /// Columns added to `history` after the first release, with their types.
 /// Databases made before then get them through `ALTER TABLE`.
 const ADDED_HISTORY_COLUMNS: [(&str, &str); 2] = [("batch", "INTEGER"), ("at", "INTEGER")];
+
+/// Where the local state (short IDs and undo history) lives: `$TODO_STATE` if
+/// set, otherwise `$XDG_DATA_HOME/todo/state.db`, which defaults to
+/// `~/.local/share/todo/state.db`.
+pub fn state_path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("TODO_STATE") {
+        return Ok(PathBuf::from(path));
+    }
+    let data_dir = match env::var_os("XDG_DATA_HOME") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(env::var_os("HOME").context("HOME is not set")?).join(".local/share"),
+    };
+    Ok(data_dir.join("todo").join("state.db"))
+}
 
 /// One change in the undo history, as listed by [`Store::history`].
 #[derive(Debug, Clone, PartialEq)]
@@ -104,6 +119,12 @@ impl<B: Backend> Store<B> {
     /// Name of the reminders list this store works on.
     pub fn list_name(&self) -> String {
         self.reminders.name()
+    }
+
+    /// Switches to the reminders list called `name`, creating it if it
+    /// doesn't exist. Task IDs stay the same in every list.
+    pub fn select_list(&mut self, name: &str) -> Result<()> {
+        self.reminders.select_list(name)
     }
 
     /// The underlying reminders list.
@@ -451,6 +472,18 @@ mod tests {
     #[test]
     fn list_name_comes_from_the_backend() {
         assert_eq!(store().list_name(), "Todo");
+    }
+
+    #[test]
+    fn select_list_switches_lists_and_keeps_ids() {
+        let mut db = store();
+        let todo = db.add(&Task::new("In Todo")).unwrap();
+        db.select_list("Shopping").unwrap();
+        assert_eq!(db.list_name(), "Shopping");
+        let milk = db.add(&Task::new("Milk")).unwrap();
+        assert_eq!((milk.id, milk.list.as_str()), (2, "Shopping"));
+        assert_eq!(titles(&db.list(&all()).unwrap()), ["Milk"]);
+        assert_eq!(db.get(todo.id).unwrap().unwrap().title, "In Todo", "IDs work across lists");
     }
 
     #[test]

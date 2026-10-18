@@ -3,9 +3,8 @@ use std::fmt::Write;
 use chrono::NaiveDate;
 use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
-use serde::Serialize;
 
-use todo::{Change, ListSummary};
+use todo::{Change, ListSummary, json};
 use todo::model::{self, DueStatus, Priority, Task};
 
 /// Prints tasks as a colored table. Colors are left out automatically when
@@ -23,16 +22,19 @@ pub fn print_task_details(task: &Task) {
     print!("{}", task_details(task, model::today()));
 }
 
-/// Prints tasks as a JSON array, one object per task (see [`JsonTask`]).
+/// Prints tasks as a JSON array, one object per task (see [`json::task`]).
 pub fn print_tasks_json(tasks: &[Task]) -> serde_json::Result<()> {
-    let tasks: Vec<JsonTask> = tasks.iter().map(JsonTask::from).collect();
-    println!("{}", serde_json::to_string_pretty(&tasks)?);
-    Ok(())
+    print_json(&json::tasks(tasks))
 }
 
-/// Prints one task as a JSON object (see [`JsonTask`]).
+/// Prints one task as a JSON object (see [`json::task`]).
 pub fn print_task_json(task: &Task) -> serde_json::Result<()> {
-    println!("{}", serde_json::to_string_pretty(&JsonTask::from(task))?);
+    print_json(&json::task(task))
+}
+
+/// Prints a JSON value, indented.
+pub fn print_json(value: &serde_json::Value) -> serde_json::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 
@@ -43,12 +45,7 @@ pub fn print_lists(lists: &[ListSummary]) {
 
 /// Prints the lists as `[{"name": "Todo", "open": 4}, ...]`.
 pub fn print_lists_json(lists: &[ListSummary]) -> serde_json::Result<()> {
-    println!("{}", serde_json::to_string_pretty(&lists_json(lists))?);
-    Ok(())
-}
-
-fn lists_json(lists: &[ListSummary]) -> serde_json::Value {
-    lists.iter().map(|l| serde_json::json!({ "name": l.name, "open": l.open })).collect()
+    print_json(&json::lists(lists))
 }
 
 fn lists_text(lists: &[ListSummary]) -> String {
@@ -72,23 +69,7 @@ pub fn print_history(changes: &[Change]) {
 /// Prints the history as an array of
 /// `{"action", "id", "title", "at", "batch"}` objects, newest first.
 pub fn print_history_json(changes: &[Change]) -> serde_json::Result<()> {
-    println!("{}", serde_json::to_string_pretty(&history_json(changes))?);
-    Ok(())
-}
-
-fn history_json(changes: &[Change]) -> serde_json::Value {
-    changes
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "action": c.action,
-                "id": c.task_id,
-                "title": c.title,
-                "at": c.at.map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
-                "batch": c.batch,
-            })
-        })
-        .collect()
+    print_json(&json::history(changes))
 }
 
 fn history_table(changes: &[Change]) -> Table {
@@ -107,44 +88,6 @@ fn history_table(changes: &[Change]) -> Table {
         ]);
     }
     table
-}
-
-/// A task as JSON output shows it. Unlike `Task`'s own serialization (used
-/// for the undo history), the values use the same words as the command-line
-/// options, so they can be passed straight back: `"high"`, `"every 2 weeks"`.
-#[derive(Serialize)]
-struct JsonTask<'a> {
-    id: i64,
-    title: &'a str,
-    done: bool,
-    due: Option<NaiveDate>,
-    /// "15:00", or `None` for an all-day task.
-    due_time: Option<String>,
-    priority: Option<&'static str>,
-    tags: &'a [String],
-    notes: &'a str,
-    repeat: Option<String>,
-    list: &'a str,
-}
-
-impl<'a> From<&'a Task> for JsonTask<'a> {
-    fn from(task: &'a Task) -> JsonTask<'a> {
-        JsonTask {
-            id: task.id,
-            title: &task.title,
-            done: task.done,
-            due: task.due,
-            due_time: task.due.and(task.due_time).map(|t| t.format("%H:%M").to_string()),
-            priority: match task.priority {
-                Priority::None => None,
-                priority => Some(priority.label()),
-            },
-            tags: &task.tags,
-            notes: &task.notes,
-            repeat: task.repeat.map(|r| r.label()),
-            list: &task.list,
-        }
-    }
 }
 
 fn tasks_table(tasks: &[Task], today: NaiveDate) -> Table {
@@ -304,48 +247,16 @@ mod tests {
     }
 
     #[test]
-    fn json_uses_command_line_words() {
-        let value = serde_json::to_value(JsonTask::from(&full_task())).unwrap();
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "id": 7,
-                "title": "Weekly sync",
-                "done": false,
-                "due": "2026-10-20",
-                "due_time": "09:30",
-                "priority": "high",
-                "tags": ["work", "urgent"],
-                "notes": "Bring the report\nand slides",
-                "repeat": "every 2 weeks",
-                "list": "Todo",
-            })
-        );
-    }
-
-    #[test]
-    fn json_uses_null_for_empty_fields() {
-        let value = serde_json::to_value(JsonTask::from(&Task::new("Bare"))).unwrap();
-        for field in ["due", "due_time", "priority", "repeat"] {
-            assert!(value[field].is_null(), "{field} should be null: {value}");
-        }
-    }
-
-    #[test]
-    fn lists_as_text_and_json() {
+    fn lists_as_text() {
         let lists = [
             ListSummary { name: "Shopping".into(), open: 3 },
             ListSummary { name: "Todo".into(), open: 0 },
         ];
         assert_eq!(lists_text(&lists), "Shopping  3 open\nTodo      0 open\n");
-        assert_eq!(
-            lists_json(&lists),
-            serde_json::json!([{ "name": "Shopping", "open": 3 }, { "name": "Todo", "open": 0 }])
-        );
     }
 
     #[test]
-    fn history_as_table_and_json() {
+    fn history_as_table() {
         use chrono::TimeZone;
         let at = chrono::Local.with_ymd_and_hms(2026, 10, 18, 14, 3, 0).unwrap();
         let changes = [
@@ -356,12 +267,6 @@ mod tests {
         for text in ["When", "2026-10-18 14:03", "done", "Milk", "add", "Old"] {
             assert!(table.contains(text), "missing {text:?} in:\n{table}");
         }
-        let json = history_json(&changes);
-        assert_eq!(json[0]["action"], "done");
-        assert_eq!(json[0]["id"], 3);
-        assert_eq!(json[0]["batch"], 2);
-        assert!(json[0]["at"].as_str().unwrap().starts_with("2026-10-18T14:03:00"));
-        assert!(json[1]["at"].is_null() && json[1]["batch"].is_null());
     }
 
     #[test]
