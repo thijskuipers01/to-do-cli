@@ -5,17 +5,37 @@ mod display;
 mod notify;
 mod tui;
 
+use std::env;
 use std::io;
+use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Parser;
-use todo::{RemindersList, Store};
+use todo::{ErrorKind, RemindersList, Store};
 
 use cli::{Cli, Command};
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn main() -> ExitCode {
+    // Looked up before parsing, so that even a parse error can be JSON.
+    let json = cli::wants_json(env::args_os().skip(1));
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // `--help` and `--version` also end up here; clap prints those as usual.
+        Err(err) if !json || !err.use_stderr() => err.exit(),
+        Err(err) => return cli::report_json_error(ErrorKind::InvalidInput, &cli::clap_message(&err)),
+    };
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) if json => cli::report_json_error(ErrorKind::of(&err), &format!("{err:#}")),
+        // The same output as returning the error from `main`.
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
+fn run(cli: Cli) -> Result<()> {
     // Completions don't need Reminders, so handle them before asking for access.
     if let Command::Completions { shell } = cli.command {
         cli::print_completions(shell, &mut io::stdout());

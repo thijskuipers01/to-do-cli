@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::error::Error;
 use crate::model::Task;
 use crate::reminders::{Backend, RemindersList};
 use convert::{to_data, to_task};
@@ -212,13 +213,13 @@ impl<B: Backend> Store<B> {
     }
 
     fn require(&self, id: i64) -> Result<Task> {
-        self.get(id)?.with_context(|| format!("no task with id {id}"))
+        self.get(id)?.ok_or_else(|| Error::no_task(id).into())
     }
 
     fn write(&self, task: &Task) -> Result<()> {
         let reminder_id = self
             .reminder_id(task.id)?
-            .with_context(|| format!("no task with id {}", task.id))?;
+            .ok_or_else(|| Error::no_task(task.id))?;
         self.reminders.update(&reminder_id, &to_data(task))
     }
 

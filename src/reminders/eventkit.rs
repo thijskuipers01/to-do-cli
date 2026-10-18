@@ -4,7 +4,7 @@
 
 use std::sync::mpsc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use block2::RcBlock;
 use chrono::{Datelike, NaiveDate};
 use objc2::AnyThread;
@@ -16,6 +16,7 @@ use objc2_event_kit::{
 use objc2_foundation::{NSArray, NSDateComponents, NSError, NSPredicate, NSString};
 
 use super::{Backend, ListSummary, Reminder, ReminderData, summarize};
+use crate::error::{Error, ErrorKind};
 use crate::model::{Repeat, RepeatUnit};
 
 /// One list in the Reminders app.
@@ -165,10 +166,12 @@ fn request_access(store: &EKEventStore) -> Result<()> {
     });
     unsafe { store.requestFullAccessToRemindersWithCompletion(RcBlock::as_ptr(&handler)) };
     if !rx.recv().unwrap_or(false) {
-        bail!(
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
             "todo has no access to Reminders. Allow your terminal app under \
-             System Settings → Privacy & Security → Reminders, then try again."
-        );
+             System Settings → Privacy & Security → Reminders, then try again.",
+        )
+        .into());
     }
     Ok(())
 }

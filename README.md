@@ -121,7 +121,6 @@ task they changed (so you get the ID of a new task back). `undo` prints
 `{"undone": "..."}`, or `{"undone": null}` when there is nothing to undo.
 `lists` prints `[{"name": "Todo", "open": 4}, ...]`; use it to find the right
 list name, since `--list` creates a list that doesn't exist yet.
-Errors still go to stderr with a non-zero exit code.
 
 ```sh
 $ todo add "Dentist" --due friday --priority high --tag health --json
@@ -142,6 +141,25 @@ $ todo add "Dentist" --due friday --priority high --tag health --json
 
 Values use the same words as the options (`"high"`, `"every 2 weeks"`), so
 they can be passed straight back to `add` or `edit`. Empty fields are `null`.
+
+Errors go to stderr as JSON too, with an exit code per kind of error:
+
+```sh
+$ todo show 7 --json
+{"error":"not_found","message":"no task with id 7"}
+$ echo $?
+3
+```
+
+| `error` | Exit code | When |
+|---|---|---|
+| `invalid_input` | 2 | a bad date or priority, an unknown option, `edit` with nothing to change |
+| `not_found` | 3 | no task with that ID |
+| `permission_denied` | 4 | no access to Reminders |
+| `other` | 1 | anything else |
+
+Without `--json`, errors are printed as plain text (`Error: no task with id 7`)
+with exit code 1, or 2 for a mistake in the options.
 
 ### Input formats
 

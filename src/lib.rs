@@ -10,6 +10,9 @@
 //! - [`store`]: the [`Store`], which adds short task numbers, filtering,
 //!   sorting and an undo history on top of a backend.
 //!
+//! [`ErrorKind::of`] tells apart errors such as a missing task or no access
+//! to Reminders.
+//!
 //! The `todo` command-line program in `src/bin/todo` is built on this
 //! library. Its extra dependencies sit behind the `cli` feature (on by
 //! default); use `default-features = false` to get only the library.
@@ -34,10 +37,12 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod error;
 pub mod model;
 pub mod reminders;
 pub mod store;
 
+pub use error::{Error, ErrorKind};
 pub use model::{DueStatus, Priority, Repeat, RepeatUnit, Task};
 pub use reminders::{Backend, ListSummary, MemoryList, Reminder, ReminderData, RemindersList};
 pub use store::{Filter, SortKey, Store};

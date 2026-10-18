@@ -1,15 +1,17 @@
 //! The command-line options, and running each command.
 
 use std::env;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use todo::model::{self, Priority, Repeat, Task};
-use todo::{Backend, Filter, ListSummary, SortKey, Store};
+use todo::{Backend, Error, ErrorKind, Filter, ListSummary, SortKey, Store};
 
 use crate::{display, notify, tui};
 
@@ -25,6 +27,45 @@ pub fn state_path() -> Result<PathBuf> {
         _ => PathBuf::from(env::var_os("HOME").context("HOME is not set")?).join(".local/share"),
     };
     Ok(data_dir.join("todo").join("state.db"))
+}
+
+// ---------------------------------------------------------------------------
+// Errors as JSON
+// ---------------------------------------------------------------------------
+
+/// Whether `--json` is among the arguments (before a `--`, after which
+/// everything is a value).
+pub fn wants_json(args: impl IntoIterator<Item = OsString>) -> bool {
+    args.into_iter().take_while(|arg| arg != "--").any(|arg| arg == "--json")
+}
+
+/// The exit code for each kind of error.
+pub fn exit_code(kind: ErrorKind) -> u8 {
+    match kind {
+        ErrorKind::Other => 1,
+        ErrorKind::InvalidInput => 2,
+        ErrorKind::NotFound => 3,
+        ErrorKind::PermissionDenied => 4,
+    }
+}
+
+/// `{"error": "not_found", "message": "no task with id 7"}`
+pub fn error_json(kind: ErrorKind, message: &str) -> String {
+    serde_json::json!({ "error": kind.name(), "message": message }).to_string()
+}
+
+/// Prints the error as JSON on stderr and returns the matching exit code.
+pub fn report_json_error(kind: ErrorKind, message: &str) -> ExitCode {
+    eprintln!("{}", error_json(kind, message));
+    ExitCode::from(exit_code(kind))
+}
+
+/// The first line of a clap error without the "error: " in front, e.g.
+/// "unexpected argument '--foo' found".
+pub fn clap_message(error: &clap::Error) -> String {
+    let text = error.render().to_string();
+    let line = text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
+    line.trim_start_matches("error: ").trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -214,10 +255,10 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
                 && !no_notes
                 && append_notes.is_none()
             {
-                bail!("nothing to change; see `todo edit --help` for the options");
+                return Err(Error::invalid_input("nothing to change; see `todo edit --help` for the options").into());
             }
 
-            let mut task = db.get(id)?.with_context(|| format!("no task with id {id}"))?;
+            let mut task = db.get(id)?.ok_or_else(|| Error::no_task(id))?;
             if let Some(title) = title {
                 task.title = title;
             }
@@ -278,7 +319,7 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
             }
         }
         Command::Show { id } => {
-            let task = db.get(id)?.with_context(|| format!("no task with id {id}"))?;
+            let task = db.get(id)?.ok_or_else(|| Error::no_task(id))?;
             if json {
                 display::print_task_json(&task)?;
             } else {
@@ -523,6 +564,39 @@ mod tests {
         assert_eq!(append_line("", "a"), "a");
         assert_eq!(append_line("a\n", "b"), "a\nb");
         assert_eq!(append_line("a", "b"), "a\nb");
+    }
+
+    #[test]
+    fn errors_have_a_kind_an_exit_code_and_json() {
+        let mut db = crate::test_store();
+        let kind = |db: &mut Store<_>, args: &[&str]| ErrorKind::of(&run(command(args), true, db).unwrap_err());
+        assert_eq!(kind(&mut db, &["edit", "1"]), ErrorKind::InvalidInput);
+        assert_eq!(kind(&mut db, &["show", "7"]), ErrorKind::NotFound);
+        assert_eq!(kind(&mut db, &["done", "7"]), ErrorKind::NotFound);
+        assert_eq!(kind(&mut db, &["edit", "7", "-p", "low"]), ErrorKind::NotFound);
+
+        let codes = [ErrorKind::Other, ErrorKind::InvalidInput, ErrorKind::NotFound, ErrorKind::PermissionDenied];
+        assert_eq!(codes.map(exit_code), [1, 2, 3, 4]);
+        assert_eq!(
+            error_json(ErrorKind::NotFound, "no task with id 7"),
+            r#"{"error":"not_found","message":"no task with id 7"}"#
+        );
+    }
+
+    #[test]
+    fn argument_errors_become_short_messages() {
+        let message = |args: &[&str]| clap_message(&parse(args).err().unwrap());
+        assert_eq!(message(&["add", "x", "--bogus"]), "unexpected argument '--bogus' found");
+        assert!(message(&["add", "x", "--due", "someday"]).contains("expected YYYY-MM-DD"));
+        assert!(message(&["add", "x", "--priority", "urgent"]).contains("urgent"));
+    }
+
+    #[test]
+    fn wants_json_stops_at_double_dash() {
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(wants_json(args(&["list", "--json"])));
+        assert!(!wants_json(args(&["list"])));
+        assert!(!wants_json(args(&["add", "--", "--json"])));
     }
 
     #[test]
