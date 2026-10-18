@@ -172,15 +172,17 @@ pub enum Command {
         /// ID of the task
         id: i64,
     },
-    /// Mark a task as done
+    /// Mark one or more tasks as done
     Done {
-        /// ID of the task
-        id: i64,
+        /// IDs of the tasks; nothing changes if one doesn't exist
+        #[arg(required = true)]
+        ids: Vec<i64>,
     },
-    /// Remove a task
+    /// Remove one or more tasks
     Remove {
-        /// ID of the task
-        id: i64,
+        /// IDs of the tasks; nothing changes if one doesn't exist
+        #[arg(required = true)]
+        ids: Vec<i64>,
     },
     /// Show all Reminders lists and how many unfinished tasks each has
     Lists,
@@ -217,7 +219,8 @@ pub fn print_completions(shell: Shell, out: &mut impl Write) {
 /// Runs one command. Generic over the reminders list so the tests can run
 /// commands against an in-memory list instead of the real Reminders app.
 /// With `json`, commands print JSON: the tasks for `list`, `today` and `show`,
-/// and the changed task for `add`, `edit`, `done` and `remove`.
+/// and the changed task for `add`, `edit`, `done` and `remove` (an array
+/// when `done` or `remove` get several IDs).
 pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Result<()> {
     match command {
         Command::Add { title, due, priority, tags, every, notes } => {
@@ -326,25 +329,28 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
                 display::print_task_details(&task);
             }
         }
-        Command::Done { id } => {
-            let task = db.set_done(id, true)?;
+        Command::Done { ids } => {
+            let tasks = db.set_done_many(&ids, true)?;
             if json {
-                display::print_task_json(&task)?;
-                return Ok(());
+                return print_changed_json(&ids, &tasks);
             }
-            match (task.done, task.due) {
-                (false, Some(next)) => {
-                    println!("Completed task {id}: {} (repeats, next due {next})", task.title)
+            for task in tasks {
+                match (task.done, task.due) {
+                    (false, Some(next)) => println!(
+                        "Completed task {}: {} (repeats, next due {next})",
+                        task.id, task.title
+                    ),
+                    _ => println!("Completed task {}: {}", task.id, task.title),
                 }
-                _ => println!("Completed task {id}: {}", task.title),
             }
         }
-        Command::Remove { id } => {
-            let task = db.remove(id)?;
+        Command::Remove { ids } => {
+            let tasks = db.remove_many(&ids)?;
             if json {
-                display::print_task_json(&task)?;
-            } else {
-                println!("Removed task {id}: {}", task.title);
+                return print_changed_json(&ids, &tasks);
+            }
+            for task in tasks {
+                println!("Removed task {}: {}", task.id, task.title);
             }
         }
         Command::Lists => print_lists(&db.backend().lists()?, json)?,
@@ -358,6 +364,16 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
         Command::Completions { .. } => unreachable!("handled above"),
     }
 
+    Ok(())
+}
+
+/// The tasks changed by `done` or `remove`: one object for a single ID (as
+/// before several IDs were possible), otherwise an array.
+fn print_changed_json(ids: &[i64], tasks: &[Task]) -> Result<()> {
+    match (ids, tasks) {
+        ([_], [task]) => display::print_task_json(task)?,
+        _ => display::print_tasks_json(tasks)?,
+    }
     Ok(())
 }
 
@@ -444,6 +460,8 @@ mod tests {
             &["add", "x", "--priority", "urgent"],
             &["add", "x", "--every", "fortnight"],
             &["done", "one"],
+            &["done"],
+            &["remove"],
             &["completions", "notashell"],
         ] {
             assert!(parse(args).is_err(), "should reject {args:?}");
@@ -597,6 +615,29 @@ mod tests {
         assert!(wants_json(args(&["list", "--json"])));
         assert!(!wants_json(args(&["list"])));
         assert!(!wants_json(args(&["add", "--", "--json"])));
+    }
+
+    #[test]
+    fn done_and_remove_take_several_ids_and_undo_them_together() {
+        let mut db = crate::test_store();
+        for title in ["a", "b", "c"] {
+            run(command(&["add", title]), false, &mut db).unwrap();
+        }
+        let Command::Done { ids } = command(&["done", "1", "3"]) else { panic!("not done") };
+        assert_eq!(ids, [1, 3]);
+        run(command(&["done", "1", "3", "--json"]), true, &mut db).unwrap();
+        let done: Vec<i64> = db.list(&Filter::default()).unwrap().iter().filter(|t| t.done).map(|t| t.id).collect();
+        assert_eq!(done, [1, 3]);
+
+        let error = run(command(&["remove", "2", "9"]), false, &mut db).unwrap_err();
+        assert_eq!(error.to_string(), "no task with id 9");
+        assert!(db.get(2).unwrap().is_some(), "nothing removed");
+
+        run(command(&["remove", "1", "2"]), false, &mut db).unwrap();
+        run(command(&["undo"]), false, &mut db).unwrap();
+        assert_eq!(db.list(&Filter::default()).unwrap().len(), 3);
+        run(command(&["undo"]), false, &mut db).unwrap();
+        assert!(db.list(&Filter::default()).unwrap().iter().all(|t| !t.done));
     }
 
     #[test]

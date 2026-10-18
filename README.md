@@ -85,6 +85,7 @@ todo edit 3 -t urgent --untag work --no-repeat       # tags and repeat
 todo add "Dentist" --notes "Bring insurance card"    # notes
 todo edit 3 --append-notes "Booked by phone"         # add a line to the notes
 todo done 3
+todo done 3 5 7                                      # several at once
 todo remove 3
 todo lists                                           # which Reminders lists exist
 todo undo                                            # repeat to go further back
@@ -102,8 +103,8 @@ Run `todo --help` or `todo <command> --help` for every option.
 | `today` | Unfinished tasks that are overdue or due today |
 | `show <id>` | Every detail of one task, including its notes |
 | `edit <id>` | Change a task: `--title`, `-d/--due`, `--no-due`, `-p/--priority`, `-t/--tag`, `--untag`, `-e/--every`, `--no-repeat`, `--notes`, `--no-notes`, `--append-notes` |
-| `done <id>` | Mark a task as done |
-| `remove <id>` | Delete a task |
+| `done <id>...` | Mark one or more tasks as done |
+| `remove <id>...` | Delete one or more tasks |
 | `lists` | All Reminders lists, with the number of unfinished tasks in each |
 | `undo` | Undo the last change; repeat to go further back |
 | `tui` | Open the terminal UI |
@@ -117,7 +118,8 @@ Every command also accepts `-l/--list <name>` to work on another Reminders list.
 Add `--json` to get machine-readable output, for scripts or an AI assistant
 that manages your tasks through `todo`. `list` and `today` print an array of
 tasks, `show` prints one task, and `add`, `edit`, `done` and `remove` print the
-task they changed (so you get the ID of a new task back). `undo` prints
+task they changed (so you get the ID of a new task back); `done` and `remove`
+with several IDs print an array. `undo` prints
 `{"undone": "..."}`, or `{"undone": null}` when there is nothing to undo.
 `lists` prints `[{"name": "Todo", "open": 4}, ...]`; use it to find the right
 list name, since `--list` creates a list that doesn't exist yet.
@@ -210,6 +212,10 @@ only be set from the command line; the terminal UI form has no notes field.
 
 **Priorities** map to the ones in Reminders: high shows as `!!!`, medium as
 `!!` and low as `!` on your phone.
+
+**Several IDs.** `done` and `remove` accept several IDs. All of them are
+checked first: if one doesn't exist, nothing is changed. One `undo` reverts
+the whole command.
 
 **Repeating tasks** work like they do in Reminders: completing one moves it to
 its next date and keeps a completed copy as a record. A repeating task needs a
