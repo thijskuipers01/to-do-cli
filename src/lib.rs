@@ -38,6 +38,7 @@
 //! ```
 
 pub mod error;
+pub mod json;
 pub mod model;
 pub mod reminders;
 pub mod store;

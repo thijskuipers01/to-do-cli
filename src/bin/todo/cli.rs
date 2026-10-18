@@ -1,32 +1,22 @@
 //! The command-line options, and running each command.
 
-use std::env;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{Days, NaiveDate};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use todo::model::{self, Due, Priority, Repeat, Task};
-use todo::{Backend, Error, ErrorKind, Filter, ListSummary, SortKey, Store};
+use todo::{Backend, Error, ErrorKind, Filter, ListSummary, SortKey, Store, json};
 
 use crate::{display, notify, tui};
 
-/// Where the local state (short IDs and undo history) lives: `$TODO_STATE` if
-/// set, otherwise `$XDG_DATA_HOME/todo/state.db`, which defaults to
-/// `~/.local/share/todo/state.db`.
+/// Where the local state lives; see [`todo::store::state_path`].
 pub fn state_path() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("TODO_STATE") {
-        return Ok(PathBuf::from(path));
-    }
-    let data_dir = match env::var_os("XDG_DATA_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(env::var_os("HOME").context("HOME is not set")?).join(".local/share"),
-    };
-    Ok(data_dir.join("todo").join("state.db"))
+    todo::store::state_path()
 }
 
 // ---------------------------------------------------------------------------
@@ -49,14 +39,9 @@ pub fn exit_code(kind: ErrorKind) -> u8 {
     }
 }
 
-/// `{"error": "not_found", "message": "no task with id 7"}`
-pub fn error_json(kind: ErrorKind, message: &str) -> String {
-    serde_json::json!({ "error": kind.name(), "message": message }).to_string()
-}
-
 /// Prints the error as JSON on stderr and returns the matching exit code.
 pub fn report_json_error(kind: ErrorKind, message: &str) -> ExitCode {
-    eprintln!("{}", error_json(kind, message));
+    eprintln!("{}", json::error(kind, message));
     ExitCode::from(exit_code(kind))
 }
 
@@ -446,7 +431,7 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
             }
         }
         Command::Undo => match (db.undo()?, json) {
-            (what, true) => println!("{}", serde_json::json!({ "undone": what })),
+            (what, true) => println!("{}", json::undone(what.as_deref())),
             (Some(what), false) => println!("Undid {what}"),
             (None, false) => println!("Nothing to undo"),
         },
@@ -577,6 +562,7 @@ mod tests {
 
     #[test]
     fn state_path_defaults_to_the_data_directory() {
+        use std::env;
         let path = state_path().unwrap();
         match env::var_os("TODO_STATE") {
             Some(custom) => assert_eq!(path, PathBuf::from(custom)),
@@ -699,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn errors_have_a_kind_an_exit_code_and_json() {
+    fn errors_have_a_kind_and_an_exit_code() {
         let mut db = crate::test_store();
         let kind = |db: &mut Store<_>, args: &[&str]| ErrorKind::of(&run(command(args), true, db).unwrap_err());
         assert_eq!(kind(&mut db, &["edit", "1"]), ErrorKind::InvalidInput);
@@ -709,10 +695,6 @@ mod tests {
 
         let codes = [ErrorKind::Other, ErrorKind::InvalidInput, ErrorKind::NotFound, ErrorKind::PermissionDenied];
         assert_eq!(codes.map(exit_code), [1, 2, 3, 4]);
-        assert_eq!(
-            error_json(ErrorKind::NotFound, "no task with id 7"),
-            r#"{"error":"not_found","message":"no task with id 7"}"#
-        );
     }
 
     #[test]
