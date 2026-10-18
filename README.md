@@ -79,6 +79,8 @@ todo add "Water plants" --every week                 # repeating, starts today
 todo list                                            # everything
 todo list --pending --sort due                       # open tasks, soonest first
 todo list --tag work --search report                 # filter and search
+todo list --due-after today --due-before sunday      # due this week
+todo list --overdue                                  # unfinished and past due
 todo today                                           # overdue or due today
 todo show 3                                          # all details, including notes
 todo edit 3 --title "Final report" -d 2026-11-01     # change fields
@@ -101,7 +103,7 @@ Run `todo --help` or `todo <command> --help` for every option.
 | Command | What it does |
 |---|---|
 | `add <title>` | Add a task. Options: `-d/--due`, `-p/--priority`, `-t/--tag` (repeatable), `-e/--every`, `--notes` |
-| `list` | List tasks. Options: `-t/--tag`, `-p/--priority`, `--search`, `--pending`, `-s/--sort id\|due\|priority` |
+| `list` | List tasks. Options: `-t/--tag`, `-p/--priority`, `--search`, `--pending`, `--due-before <date>`, `--due-after <date>` (both inclusive), `--overdue` (unfinished, due before today), `--no-due` (no due date), `-s/--sort id\|due\|priority` |
 | `today` | Unfinished tasks that are overdue or due today |
 | `show <id>` | Every detail of one task, including its notes |
 | `edit <id>` | Change a task: `--title`, `-d/--due`, `--no-due`, `-p/--priority`, `-t/--tag`, `--untag`, `-e/--every`, `--no-repeat`, `--notes`, `--no-notes`, `--append-notes` |

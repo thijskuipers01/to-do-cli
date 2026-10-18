@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use chrono::{Days, NaiveDate};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use todo::model::{self, Due, Priority, Repeat, Task};
 use todo::{Backend, Error, ErrorKind, Filter, ListSummary, SortKey, Store};
@@ -148,23 +149,7 @@ pub enum Command {
         append_notes: Option<String>,
     },
     /// List tasks
-    List {
-        /// Only show tasks with this tag
-        #[arg(short, long)]
-        tag: Option<String>,
-        /// Only show tasks with this priority
-        #[arg(short, long, value_enum)]
-        priority: Option<Priority>,
-        /// Only show tasks whose title or notes contain this text
-        #[arg(long)]
-        search: Option<String>,
-        /// Hide completed tasks
-        #[arg(long)]
-        pending: bool,
-        /// Order of the list
-        #[arg(short, long, value_enum, default_value_t = SortKey::Id)]
-        sort: SortKey,
-    },
+    List(ListArgs),
     /// Show unfinished tasks that are overdue or due today
     Today,
     /// Show all details of a task, including its notes
@@ -202,6 +187,60 @@ pub enum Command {
     Completions {
         shell: Shell,
     },
+}
+
+/// The options of `todo list`.
+#[derive(Args)]
+pub struct ListArgs {
+    /// Only show tasks with this tag
+    #[arg(short, long)]
+    pub tag: Option<String>,
+    /// Only show tasks with this priority
+    #[arg(short, long, value_enum)]
+    pub priority: Option<Priority>,
+    /// Only show tasks whose title or notes contain this text
+    #[arg(long)]
+    pub search: Option<String>,
+    /// Hide completed tasks
+    #[arg(long)]
+    pub pending: bool,
+    /// Only tasks due on or before this date (same formats as `add`, without a time)
+    #[arg(long, value_parser = model::parse_due)]
+    pub due_before: Option<NaiveDate>,
+    /// Only tasks due on or after this date
+    #[arg(long, value_parser = model::parse_due)]
+    pub due_after: Option<NaiveDate>,
+    /// Only unfinished tasks due before today
+    #[arg(long)]
+    pub overdue: bool,
+    /// Only tasks without a due date
+    #[arg(long, conflicts_with_all = ["due_before", "due_after", "overdue"])]
+    pub no_due: bool,
+    /// Order of the list
+    #[arg(short, long, value_enum, default_value_t = SortKey::Id)]
+    pub sort: SortKey,
+}
+
+impl ListArgs {
+    /// The filter these options describe; `today` decides what's overdue.
+    pub fn filter(self, today: NaiveDate) -> Filter {
+        let mut filter = Filter {
+            tag: self.tag,
+            priority: self.priority,
+            search: self.search,
+            pending_only: self.pending,
+            due_by: self.due_before,
+            due_after: self.due_after,
+            no_due: self.no_due,
+            sort: self.sort,
+        };
+        if self.overdue {
+            let yesterday = today - Days::new(1);
+            filter.pending_only = true;
+            filter.due_by = Some(filter.due_by.map_or(yesterday, |by| by.min(yesterday)));
+        }
+        filter
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,8 +349,8 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
                 println!("Updated task {id}: {}", task.title);
             }
         }
-        Command::List { tag, priority, search, pending, sort } => {
-            let filter = Filter { tag, priority, search, pending_only: pending, sort, ..Filter::default() };
+        Command::List(args) => {
+            let filter = args.filter(model::today());
             let tasks = db.list(&filter)?;
             if json {
                 display::print_tasks_json(&tasks)?;
@@ -458,7 +497,7 @@ mod tests {
 
     #[test]
     fn list_filters() {
-        let Command::List { tag, priority, search, pending, sort } =
+        let Command::List(ListArgs { tag, priority, search, pending, sort, .. }) =
             command(&["list", "-t", "work", "-p", "low", "--search", "mail", "--pending", "-s", "due"])
         else {
             panic!("not a list command");
@@ -482,6 +521,9 @@ mod tests {
             &["add", "x", "--priority", "urgent"],
             &["add", "x", "--every", "fortnight"],
             &["done", "one"],
+            &["list", "--no-due", "--overdue"],
+            &["list", "--no-due", "--due-before", "today"],
+            &["list", "--due-after", "friday 15:00"],
             &["done"],
             &["remove"],
             &["completions", "notashell"],
@@ -680,6 +722,29 @@ mod tests {
         assert_eq!(db.list(&Filter::default()).unwrap().len(), 3);
         run(command(&["undo"]), false, &mut db).unwrap();
         assert!(db.list(&Filter::default()).unwrap().iter().all(|t| !t.done));
+    }
+
+    #[test]
+    fn list_filters_by_due_date() {
+        let mut db = crate::test_store();
+        let today = model::today();
+        let day = |offset: i64| (today + chrono::TimeDelta::days(offset)).to_string();
+        for (title, due) in [("Overdue", day(-2)), ("Today", day(0)), ("Next week", day(7)), ("Done late", day(-1))] {
+            run(command(&["add", title, "--due", &due]), false, &mut db).unwrap();
+        }
+        run(command(&["add", "Someday"]), false, &mut db).unwrap();
+        run(command(&["done", "4"]), false, &mut db).unwrap();
+
+        let ids = |db: &mut Store<_>, args: &[&str]| {
+            run(command(args), true, db).unwrap();
+            let Command::List(list) = command(args) else { panic!("not a list command") };
+            db.list(&list.filter(today)).unwrap().iter().map(|t| t.id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&mut db, &["list", "--overdue"]), [1]);
+        assert_eq!(ids(&mut db, &["list", "--due-before", "today"]), [1, 2, 4]);
+        assert_eq!(ids(&mut db, &["list", "--due-after", "today", "--due-before", &day(7)]), [2, 3]);
+        assert_eq!(ids(&mut db, &["list", "--no-due"]), [5]);
+        assert_eq!(ids(&mut db, &["list", "--overdue", "--due-before", &day(-3)]), Vec::<i64>::new());
     }
 
     #[test]
