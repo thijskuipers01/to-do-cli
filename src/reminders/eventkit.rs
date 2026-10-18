@@ -13,9 +13,9 @@ use objc2::runtime::Bool;
 use objc2_event_kit::{
     EKCalendar, EKEntityType, EKEventStore, EKRecurrenceFrequency, EKRecurrenceRule, EKReminder,
 };
-use objc2_foundation::{NSArray, NSDateComponents, NSError, NSString};
+use objc2_foundation::{NSArray, NSDateComponents, NSError, NSPredicate, NSString};
 
-use super::{Backend, Reminder, ReminderData};
+use super::{Backend, ListSummary, Reminder, ReminderData, summarize};
 use crate::model::{Repeat, RepeatUnit};
 
 /// One list in the Reminders app.
@@ -35,6 +35,14 @@ impl RemindersList {
             None => create_calendar(&store, name)?,
         };
         Ok(RemindersList { store, calendar })
+    }
+
+    /// Every Reminders list with its number of unfinished reminders, without
+    /// opening (and so creating) any particular list.
+    pub fn all_lists() -> Result<Vec<ListSummary>> {
+        let store = unsafe { EKEventStore::new() };
+        request_access(&store)?;
+        list_summaries(&store)
     }
 
     fn find(&self, id: &str) -> Option<Retained<EKReminder>> {
@@ -81,23 +89,9 @@ impl Backend for RemindersList {
     }
 
     fn all(&self) -> Result<Vec<Reminder>> {
-        // EventKit answers on a background thread by calling `handler`. The
-        // reminders are converted to plain Rust data there and sent back
-        // through a channel, which `recv` below waits on.
-        let (tx, rx) = mpsc::channel();
-        let handler = RcBlock::new(move |array: *mut NSArray<EKReminder>| {
-            let reminders = match unsafe { array.as_ref() } {
-                Some(array) => array.iter().map(|r| to_reminder(&r)).collect(),
-                None => Vec::new(),
-            };
-            let _ = tx.send(reminders);
-        });
         let calendars = NSArray::from_retained_slice(std::slice::from_ref(&self.calendar));
-        unsafe {
-            let predicate = self.store.predicateForRemindersInCalendars(Some(&calendars));
-            self.store.fetchRemindersMatchingPredicate_completion(&predicate, &handler);
-        }
-        rx.recv().context("Reminders did not respond")
+        let predicate = unsafe { self.store.predicateForRemindersInCalendars(Some(&calendars)) };
+        fetch(&self.store, &predicate)
     }
 
     fn get(&self, id: &str) -> Option<Reminder> {
@@ -132,6 +126,36 @@ impl Backend for RemindersList {
         }
         Ok(())
     }
+
+    fn lists(&self) -> Result<Vec<ListSummary>> {
+        list_summaries(&self.store)
+    }
+}
+
+/// Fetches the reminders matching `predicate`. EventKit answers on a
+/// background thread by calling `handler`. The reminders are converted to
+/// plain Rust data there and sent back through a channel, which `recv` below
+/// waits on.
+fn fetch(store: &EKEventStore, predicate: &NSPredicate) -> Result<Vec<Reminder>> {
+    let (tx, rx) = mpsc::channel();
+    let handler = RcBlock::new(move |array: *mut NSArray<EKReminder>| {
+        let reminders = match unsafe { array.as_ref() } {
+            Some(array) => array.iter().map(|r| to_reminder(&r)).collect(),
+            None => Vec::new(),
+        };
+        let _ = tx.send(reminders);
+    });
+    unsafe { store.fetchRemindersMatchingPredicate_completion(predicate, &handler) };
+    rx.recv().context("Reminders did not respond")
+}
+
+fn list_summaries(store: &EKEventStore) -> Result<Vec<ListSummary>> {
+    let calendars = unsafe { store.calendarsForEntityType(EKEntityType::Reminder) };
+    let names = calendars.iter().map(|calendar| unsafe { calendar.title() }.to_string());
+    let predicate = unsafe {
+        store.predicateForIncompleteRemindersWithDueDateStarting_ending_calendars(None, None, None)
+    };
+    Ok(summarize(names, &fetch(store, &predicate)?))
 }
 
 fn request_access(store: &EKEventStore) -> Result<()> {

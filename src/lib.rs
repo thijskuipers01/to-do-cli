@@ -39,5 +39,5 @@ pub mod reminders;
 pub mod store;
 
 pub use model::{DueStatus, Priority, Repeat, RepeatUnit, Task};
-pub use reminders::{Backend, MemoryList, Reminder, ReminderData, RemindersList};
+pub use reminders::{Backend, ListSummary, MemoryList, Reminder, ReminderData, RemindersList};
 pub use store::{Filter, SortKey, Store};

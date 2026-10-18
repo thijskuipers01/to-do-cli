@@ -5,6 +5,7 @@ use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use serde::Serialize;
 
+use todo::ListSummary;
 use todo::model::{self, DueStatus, Priority, Task};
 
 /// Prints tasks as a colored table. Colors are left out automatically when
@@ -33,6 +34,30 @@ pub fn print_tasks_json(tasks: &[Task]) -> serde_json::Result<()> {
 pub fn print_task_json(task: &Task) -> serde_json::Result<()> {
     println!("{}", serde_json::to_string_pretty(&JsonTask::from(task))?);
     Ok(())
+}
+
+/// Prints the Reminders lists, one per line with the number of open tasks.
+pub fn print_lists(lists: &[ListSummary]) {
+    print!("{}", lists_text(lists));
+}
+
+/// Prints the lists as `[{"name": "Todo", "open": 4}, ...]`.
+pub fn print_lists_json(lists: &[ListSummary]) -> serde_json::Result<()> {
+    println!("{}", serde_json::to_string_pretty(&lists_json(lists))?);
+    Ok(())
+}
+
+fn lists_json(lists: &[ListSummary]) -> serde_json::Value {
+    lists.iter().map(|l| serde_json::json!({ "name": l.name, "open": l.open })).collect()
+}
+
+fn lists_text(lists: &[ListSummary]) -> String {
+    let width = lists.iter().map(|l| l.name.chars().count()).max().unwrap_or(0);
+    let mut out = String::new();
+    for list in lists {
+        let _ = writeln!(out, "{:<width$}  {} open", list.name, list.open);
+    }
+    out
 }
 
 /// A task as JSON output shows it. Unlike `Task`'s own serialization (used
@@ -250,6 +275,19 @@ mod tests {
         for field in ["due", "priority", "repeat"] {
             assert!(value[field].is_null(), "{field} should be null: {value}");
         }
+    }
+
+    #[test]
+    fn lists_as_text_and_json() {
+        let lists = [
+            ListSummary { name: "Shopping".into(), open: 3 },
+            ListSummary { name: "Todo".into(), open: 0 },
+        ];
+        assert_eq!(lists_text(&lists), "Shopping  3 open\nTodo      0 open\n");
+        assert_eq!(
+            lists_json(&lists),
+            serde_json::json!([{ "name": "Shopping", "open": 3 }, { "name": "Todo", "open": 0 }])
+        );
     }
 
     #[test]

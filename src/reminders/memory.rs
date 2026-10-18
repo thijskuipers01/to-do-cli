@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 
 use anyhow::{Context, Result};
 
-use super::{Backend, Reminder, ReminderData};
+use super::{Backend, ListSummary, Reminder, ReminderData, summarize};
 
 /// A reminders list kept entirely in memory: useful for tests, or for trying
 /// the library without touching the Reminders app. Reminders in other lists
@@ -88,6 +88,13 @@ impl Backend for MemoryList {
         self.reminders.borrow_mut().retain(|r| r.id != id);
         Ok(())
     }
+
+    /// The current list and every list that holds a reminder.
+    fn lists(&self) -> Result<Vec<ListSummary>> {
+        let reminders = self.reminders.borrow();
+        let names = reminders.iter().map(|r| r.list.clone()).chain([self.name()]);
+        Ok(summarize(names, reminders.iter().filter(|r| !r.data.done)))
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +128,17 @@ mod tests {
         assert_eq!(list.name(), "Shopping");
         assert_eq!(list.all().unwrap().iter().map(|r| &r.id).collect::<Vec<_>>(), [&shopping]);
         assert_eq!(list.ids(), [todo, shopping]);
+    }
+
+    #[test]
+    fn lists_counts_open_reminders_in_every_list() {
+        let list = MemoryList::new("Todo");
+        list.push(ReminderData::new("a"), "Shopping");
+        list.push(ReminderData::new("b"), "Shopping");
+        list.push(ReminderData { done: true, ..ReminderData::new("c") }, "Shopping");
+        list.push(ReminderData { done: true, ..ReminderData::new("d") }, "Work");
+        let summary = |name: &str, open| ListSummary { name: name.into(), open };
+        assert_eq!(list.lists().unwrap(), [summary("Shopping", 2), summary("Todo", 0), summary("Work", 0)]);
     }
 
     #[test]

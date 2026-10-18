@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use todo::model::{self, Priority, Repeat, Task};
-use todo::{Backend, Filter, SortKey, Store};
+use todo::{Backend, Filter, ListSummary, SortKey, Store};
 
 use crate::{display, notify, tui};
 
@@ -141,6 +141,8 @@ pub enum Command {
         /// ID of the task
         id: i64,
     },
+    /// Show all Reminders lists and how many unfinished tasks each has
+    Lists,
     /// Undo the last change (can be repeated)
     Undo,
     /// Open the interactive terminal UI
@@ -156,6 +158,16 @@ pub enum Command {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+
+/// Prints the lists from `todo lists`.
+pub fn print_lists(lists: &[ListSummary], json: bool) -> Result<()> {
+    if json {
+        display::print_lists_json(lists)?;
+    } else {
+        display::print_lists(lists);
+    }
+    Ok(())
+}
 
 pub fn print_completions(shell: Shell, out: &mut impl Write) {
     clap_complete::generate(shell, &mut Cli::command(), "todo", out);
@@ -294,6 +306,7 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
                 println!("Removed task {id}: {}", task.title);
             }
         }
+        Command::Lists => print_lists(&db.backend().lists()?, json)?,
         Command::Undo => match (db.undo()?, json) {
             (what, true) => println!("{}", serde_json::json!({ "undone": what })),
             (Some(what), false) => println!("Undid {what}"),
@@ -435,6 +448,7 @@ mod tests {
             vec!["done", "2"],
             vec!["remove", "1"],
             vec!["undo"],
+            vec!["lists"],
         ];
         for args in commands {
             run(command(&args), false, &mut db).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
@@ -457,6 +471,7 @@ mod tests {
             vec!["remove", "1", "--json"],
             vec!["undo", "--json"],
             vec!["undo", "--json"],
+            vec!["lists", "--json"],
         ] {
             let cli = parse(&args).unwrap();
             assert!(cli.json, "{args:?} should set --json");

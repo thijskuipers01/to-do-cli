@@ -9,7 +9,7 @@ use std::io;
 
 use anyhow::Result;
 use clap::Parser;
-use todo::Store;
+use todo::{RemindersList, Store};
 
 use cli::{Cli, Command};
 
@@ -20,6 +20,11 @@ fn main() -> Result<()> {
     if let Command::Completions { shell } = cli.command {
         cli::print_completions(shell, &mut io::stdout());
         return Ok(());
+    }
+    // Neither do lists need one particular list, which would be created if
+    // it didn't exist.
+    if let Command::Lists = cli.command {
+        return cli::print_lists(&RemindersList::all_lists()?, cli.json);
     }
 
     let mut store = Store::open(&cli::state_path()?, &cli.list)?;

@@ -86,6 +86,7 @@ todo add "Dentist" --notes "Bring insurance card"    # notes
 todo edit 3 --append-notes "Booked by phone"         # add a line to the notes
 todo done 3
 todo remove 3
+todo lists                                           # which Reminders lists exist
 todo undo                                            # repeat to go further back
 todo tui                                             # interactive mode
 ```
@@ -103,6 +104,7 @@ Run `todo --help` or `todo <command> --help` for every option.
 | `edit <id>` | Change a task: `--title`, `-d/--due`, `--no-due`, `-p/--priority`, `-t/--tag`, `--untag`, `-e/--every`, `--no-repeat`, `--notes`, `--no-notes`, `--append-notes` |
 | `done <id>` | Mark a task as done |
 | `remove <id>` | Delete a task |
+| `lists` | All Reminders lists, with the number of unfinished tasks in each |
 | `undo` | Undo the last change; repeat to go further back |
 | `tui` | Open the terminal UI |
 | `notify` | Show a macOS notification for tasks due tomorrow |
@@ -117,6 +119,8 @@ that manages your tasks through `todo`. `list` and `today` print an array of
 tasks, `show` prints one task, and `add`, `edit`, `done` and `remove` print the
 task they changed (so you get the ID of a new task back). `undo` prints
 `{"undone": "..."}`, or `{"undone": null}` when there is nothing to undo.
+`lists` prints `[{"name": "Todo", "open": 4}, ...]`; use it to find the right
+list name, since `--list` creates a list that doesn't exist yet.
 Errors still go to stderr with a non-zero exit code.
 
 ```sh
