@@ -28,7 +28,8 @@ $ todo list --pending --sort due
 - **Multiple lists** (`--list Shopping`)
 - A macOS **notification** for tasks due tomorrow
 - **Tab completion** for zsh, bash and fish
-- **JSON output** (`--json`) for scripts and AI assistants
+- **JSON output** (`--json`) for scripts and AI assistants, and a
+  [Claude Code skill](skills/todo/SKILL.md) that teaches agents to use it
 
 ## Requirements
 
@@ -174,6 +175,23 @@ $ echo $?
 Without `--json`, errors are printed as plain text (`Error: no task with id 7`)
 with exit code 1, or 2 for a mistake in the options.
 
+### Using it from Claude Code
+
+The repository includes a [skill](skills/todo/SKILL.md) that teaches Claude
+Code (and other agents that read `SKILL.md` files) to manage your tasks with
+`todo --json`, instead of scripting the Reminders app. It explains the
+commands, the input formats, to look up IDs and list names before changing
+anything, and `--dry-run` and `undo`. Install it for all your projects:
+
+```sh
+mkdir -p ~/.claude/skills
+cp -r skills/todo ~/.claude/skills/
+```
+
+Or, to use it in one project only, copy it to that project's
+`.claude/skills/` folder. Then ask things like "what's due this week?" or
+"add milk to my shopping list". Copy it again after updating `todo`.
+
 ### Input formats
 
 | What | Accepted values |
@@ -318,6 +336,7 @@ sync to iCloud briefly) and delete them afterwards. They need Reminders access.
 ```
 src/
 ├── lib.rs                 library entry point and public API
+├── error.rs               Error, ErrorKind
 ├── model/                 data types, no storage
 │   ├── task.rs            Task, DueStatus
 │   ├── priority.rs        Priority
@@ -341,4 +360,6 @@ src/
         └── form.rs        the add/edit form
 tests/
 └── library.rs             uses the library through its public API only
+skills/
+└── todo/SKILL.md          teaches AI agents to use `todo`
 ```
