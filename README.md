@@ -90,6 +90,7 @@ todo edit 3 --append-notes "Booked by phone"         # add a line to the notes
 todo done 3
 todo done 3 5 7                                      # several at once
 todo remove 3
+todo edit 3 --due monday --dry-run                   # show the result, change nothing
 todo lists                                           # which Reminders lists exist
 todo history                                         # recent changes, newest first
 todo undo                                            # repeat to go further back
@@ -106,9 +107,9 @@ Run `todo --help` or `todo <command> --help` for every option.
 | `list` | List tasks. Options: `-t/--tag`, `-p/--priority`, `--search`, `--pending`, `--due-before <date>`, `--due-after <date>` (both inclusive), `--overdue` (unfinished, due before today), `--no-due` (no due date), `-s/--sort id\|due\|priority` |
 | `today` | Unfinished tasks that are overdue or due today |
 | `show <id>` | Every detail of one task, including its notes |
-| `edit <id>` | Change a task: `--title`, `-d/--due`, `--no-due`, `-p/--priority`, `-t/--tag`, `--untag`, `-e/--every`, `--no-repeat`, `--notes`, `--no-notes`, `--append-notes` |
-| `done <id>...` | Mark one or more tasks as done |
-| `remove <id>...` | Delete one or more tasks |
+| `edit <id>` | Change a task: `--title`, `-d/--due`, `--no-due`, `-p/--priority`, `-t/--tag`, `--untag`, `-e/--every`, `--no-repeat`, `--notes`, `--no-notes`, `--append-notes`, `--dry-run` |
+| `done <id>...` | Mark one or more tasks as done. Option: `--dry-run` |
+| `remove <id>...` | Delete one or more tasks. Option: `--dry-run` |
 | `lists` | All Reminders lists, with the number of unfinished tasks in each |
 | `history` | The most recent changes that `undo` can revert, newest first. Option: `-n/--limit` (default 10) |
 | `undo` | Undo the last change; repeat to go further back |
@@ -223,6 +224,12 @@ only be set from the command line; the terminal UI form has no notes field.
 
 **Priorities** map to the ones in Reminders: high shows as `!!!`, medium as
 `!!` and low as `!` on your phone.
+
+**Dry runs.** `edit`, `done` and `remove` take `--dry-run`: they print the
+task(s) as they would be after the change (for `done` on a repeating task,
+with its next due date), in the same form as without it and also with
+`--json`, but nothing is saved and nothing is added to the undo history.
+Invalid input and unknown IDs are still reported as errors.
 
 **Several IDs.** `done` and `remove` accept several IDs. All of them are
 checked first: if one doesn't exist, nothing is changed. One `undo` reverts

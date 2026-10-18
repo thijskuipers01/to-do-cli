@@ -218,6 +218,39 @@ impl<B: Backend> Store<B> {
         Ok(changes)
     }
 
+    /// The tasks with these IDs (each once), or a "no task with id" error if
+    /// one doesn't exist.
+    pub fn require_all(&self, ids: &[i64]) -> Result<Vec<Task>> {
+        let mut tasks: Vec<Task> = Vec::new();
+        for &id in ids {
+            if !tasks.iter().any(|t| t.id == id) {
+                tasks.push(self.require(id)?);
+            }
+        }
+        Ok(tasks)
+    }
+
+    /// What [`Store::update`] would save for `task`, without saving it or
+    /// recording anything for `undo`. Tags are cleaned up the same way.
+    pub fn preview_update(&self, task: &Task) -> Result<Task> {
+        let current = self.require(task.id)?;
+        Ok(to_task(task.id, current.list, to_data(task)))
+    }
+
+    /// What [`Store::set_done_many`] with `done = true` would give, without
+    /// changing anything: repeating tasks with a due date stay open and move
+    /// to their next date, as Reminders does.
+    pub fn preview_done(&self, ids: &[i64]) -> Result<Vec<Task>> {
+        Ok(self
+            .require_all(ids)?
+            .into_iter()
+            .map(|task| match (task.repeat, task.due) {
+                (Some(repeat), Some(due)) => Task { due: Some(repeat.next_after(due)), ..task },
+                _ => Task { done: true, ..task },
+            })
+            .collect())
+    }
+
     /// Marks several tasks as done or not done, as one change for `undo`.
     /// When an ID doesn't exist, nothing is changed. Returns the tasks as
     /// they are now.
@@ -238,13 +271,7 @@ impl<B: Backend> Store<B> {
         ids: &[i64],
         mut change: impl FnMut(&mut Self, i64) -> Result<T>,
     ) -> Result<Vec<T>> {
-        let mut unique = Vec::new();
-        for &id in ids {
-            if !unique.contains(&id) {
-                self.require(id)?;
-                unique.push(id);
-            }
-        }
+        let unique: Vec<i64> = self.require_all(ids)?.iter().map(|t| t.id).collect();
         self.batch = Some(self.conn.query_row(
             "SELECT COALESCE(MAX(batch), 0) + 1 FROM history",
             [],
@@ -665,6 +692,32 @@ mod tests {
         db.add(&Task::new("a")).unwrap();
         db.backend().delete("memory-1").unwrap();
         assert_eq!(db.history(1).unwrap()[0].title, "");
+    }
+
+    #[test]
+    fn previews_change_nothing() {
+        let mut db = store();
+        let weekly = Some(crate::model::Repeat { unit: crate::model::RepeatUnit::Week, interval: 1 });
+        db.add(&Task { due: Some(date("2026-10-20")), repeat: weekly, ..Task::new("Plants") }).unwrap();
+        db.add(&Task::new("Milk")).unwrap();
+        let before = db.backend().all().unwrap();
+
+        let edited = db.preview_update(&Task { tags: tags(&["deep work"]), ..db.get(2).unwrap().unwrap() }).unwrap();
+        assert_eq!((edited.tags.clone(), edited.list.as_str()), (tags(&["deep-work"]), "Todo"));
+        let done = db.preview_done(&[1, 2, 1]).unwrap();
+        assert_eq!(done.len(), 2);
+        assert_eq!((done[0].done, done[0].due), (false, Some(date("2026-10-27"))), "repeats");
+        assert!(done[1].done);
+        assert_eq!(titles(&db.require_all(&[2, 1]).unwrap()), ["Milk", "Plants"]);
+        assert!(db.preview_done(&[1, 9]).is_err());
+        assert!(db.preview_update(&Task { id: 9, ..Task::new("x") }).is_err());
+
+        let after = db.backend().all().unwrap();
+        assert_eq!(
+            before.iter().map(|r| &r.data).collect::<Vec<_>>(),
+            after.iter().map(|r| &r.data).collect::<Vec<_>>()
+        );
+        assert_eq!(db.history(10).unwrap().len(), 2, "only the two adds");
     }
 
     #[test]

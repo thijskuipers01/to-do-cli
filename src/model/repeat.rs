@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use chrono::{Days, Months, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +19,20 @@ pub struct Repeat {
 }
 
 impl Repeat {
+    /// The date one interval after `date`, like Reminders moves a repeating
+    /// task when it's completed. A month later than Jan 31 is the last day of
+    /// February.
+    pub fn next_after(self, date: NaiveDate) -> NaiveDate {
+        let n = self.interval;
+        let next = match self.unit {
+            RepeatUnit::Day => date.checked_add_days(Days::new(n.into())),
+            RepeatUnit::Week => date.checked_add_days(Days::new(u64::from(n) * 7)),
+            RepeatUnit::Month => date.checked_add_months(Months::new(n)),
+            RepeatUnit::Year => date.checked_add_months(Months::new(n.saturating_mul(12))),
+        };
+        next.unwrap_or(date)
+    }
+
     /// "every week", "every 2 weeks", ...
     pub fn label(self) -> String {
         let unit = match self.unit {
@@ -84,6 +99,16 @@ mod tests {
         assert_eq!(repeat(RepeatUnit::Week, 2).label(), "every 2 weeks");
         assert_eq!(repeat(RepeatUnit::Month, 3).label(), "every 3 months");
         assert_eq!(repeat(RepeatUnit::Year, 1).label(), "every year");
+    }
+
+    #[test]
+    fn next_after_moves_one_interval_ahead() {
+        let date = |text: &str| text.parse::<NaiveDate>().unwrap();
+        let day = date("2026-01-31");
+        assert_eq!(repeat(RepeatUnit::Day, 3).next_after(day), date("2026-02-03"));
+        assert_eq!(repeat(RepeatUnit::Week, 2).next_after(day), date("2026-02-14"));
+        assert_eq!(repeat(RepeatUnit::Month, 1).next_after(day), date("2026-02-28"));
+        assert_eq!(repeat(RepeatUnit::Year, 1).next_after(date("2028-02-29")), date("2029-02-28"));
     }
 
     #[test]

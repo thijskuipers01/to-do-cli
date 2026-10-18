@@ -147,6 +147,9 @@ pub enum Command {
         /// Add a line to the end of the notes
         #[arg(long)]
         append_notes: Option<String>,
+        /// Show the task as it would be after the change, without saving it
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List tasks
     List(ListArgs),
@@ -162,12 +165,18 @@ pub enum Command {
         /// IDs of the tasks; nothing changes if one doesn't exist
         #[arg(required = true)]
         ids: Vec<i64>,
+        /// Show what would happen, without changing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Remove one or more tasks
     Remove {
         /// IDs of the tasks; nothing changes if one doesn't exist
         #[arg(required = true)]
         ids: Vec<i64>,
+        /// Show what would happen, without changing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show all Reminders lists and how many unfinished tasks each has
     Lists,
@@ -298,6 +307,7 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
             notes,
             no_notes,
             append_notes,
+            dry_run,
         } => {
             if title.is_none()
                 && due.is_none()
@@ -342,6 +352,16 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
                 task.notes = append_line(&task.notes, &line);
             }
 
+            if dry_run {
+                let task = db.preview_update(&task)?;
+                if json {
+                    display::print_task_json(&task)?;
+                } else {
+                    println!("Would update task {id} to:");
+                    display::print_task_details(&task);
+                }
+                return Ok(());
+            }
             let task = db.update(&task)?;
             if json {
                 display::print_task_json(&task)?;
@@ -382,28 +402,38 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
                 display::print_task_details(&task);
             }
         }
-        Command::Done { ids } => {
-            let tasks = db.set_done_many(&ids, true)?;
+        Command::Done { ids, dry_run } => {
+            let tasks = match dry_run {
+                true => db.preview_done(&ids)?,
+                false => db.set_done_many(&ids, true)?,
+            };
             if json {
                 return print_changed_json(&ids, &tasks);
             }
+            let verb = if dry_run { "Would complete" } else { "Completed" };
             for task in tasks {
                 match (task.done, task.due) {
-                    (false, Some(next)) => println!(
-                        "Completed task {}: {} (repeats, next due {next})",
-                        task.id, task.title
+                    (false, Some(_)) => println!(
+                        "{verb} task {}: {} (repeats, next due {})",
+                        task.id,
+                        task.title,
+                        task.due_text()
                     ),
-                    _ => println!("Completed task {}: {}", task.id, task.title),
+                    _ => println!("{verb} task {}: {}", task.id, task.title),
                 }
             }
         }
-        Command::Remove { ids } => {
-            let tasks = db.remove_many(&ids)?;
+        Command::Remove { ids, dry_run } => {
+            let tasks = match dry_run {
+                true => db.require_all(&ids)?,
+                false => db.remove_many(&ids)?,
+            };
             if json {
                 return print_changed_json(&ids, &tasks);
             }
+            let verb = if dry_run { "Would remove" } else { "Removed" };
             for task in tasks {
-                println!("Removed task {}: {}", task.id, task.title);
+                println!("{verb} task {}: {}", task.id, task.title);
             }
         }
         Command::Lists => print_lists(&db.backend().lists()?, json)?,
@@ -707,7 +737,7 @@ mod tests {
         for title in ["a", "b", "c"] {
             run(command(&["add", title]), false, &mut db).unwrap();
         }
-        let Command::Done { ids } = command(&["done", "1", "3"]) else { panic!("not done") };
+        let Command::Done { ids, .. } = command(&["done", "1", "3"]) else { panic!("not done") };
         assert_eq!(ids, [1, 3]);
         run(command(&["done", "1", "3", "--json"]), true, &mut db).unwrap();
         let done: Vec<i64> = db.list(&Filter::default()).unwrap().iter().filter(|t| t.done).map(|t| t.id).collect();
@@ -745,6 +775,34 @@ mod tests {
         assert_eq!(ids(&mut db, &["list", "--due-after", "today", "--due-before", &day(7)]), [2, 3]);
         assert_eq!(ids(&mut db, &["list", "--no-due"]), [5]);
         assert_eq!(ids(&mut db, &["list", "--overdue", "--due-before", &day(-3)]), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn dry_runs_never_change_tasks_or_the_undo_history() {
+        let mut db = crate::test_store();
+        run(command(&["add", "Dentist", "-d", "2026-10-23", "--every", "month"]), false, &mut db).unwrap();
+        run(command(&["add", "Milk"]), false, &mut db).unwrap();
+        let reminders = |db: &Store<todo::MemoryList>| {
+            db.backend().all().unwrap().into_iter().map(|r| r.data).collect::<Vec<_>>()
+        };
+        let before = (reminders(&db), db.history(100).unwrap());
+
+        for json in [false, true] {
+            for args in [
+                &["edit", "1", "--due", "monday 9:00", "--title", "X", "--dry-run"][..],
+                &["done", "1", "2", "--dry-run"],
+                &["done", "1", "--dry-run"],
+                &["remove", "1", "2", "--dry-run"],
+            ] {
+                run(command(args), json, &mut db).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
+            }
+        }
+        assert_eq!((reminders(&db), db.history(100).unwrap()), before);
+
+        // A dry run still checks its input.
+        let error = run(command(&["remove", "1", "9", "--dry-run"]), false, &mut db).unwrap_err();
+        assert_eq!(todo::ErrorKind::of(&error), todo::ErrorKind::NotFound);
+        assert!(run(command(&["edit", "1", "--dry-run"]), false, &mut db).is_err(), "nothing to change");
     }
 
     #[test]
