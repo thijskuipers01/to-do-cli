@@ -82,6 +82,8 @@ todo today                                           # overdue or due today
 todo show 3                                          # all details, including notes
 todo edit 3 --title "Final report" -d 2026-11-01     # change fields
 todo edit 3 -t urgent --untag work --no-repeat       # tags and repeat
+todo add "Dentist" --notes "Bring insurance card"    # notes
+todo edit 3 --append-notes "Booked by phone"         # add a line to the notes
 todo done 3
 todo remove 3
 todo undo                                            # repeat to go further back
@@ -94,11 +96,11 @@ Run `todo --help` or `todo <command> --help` for every option.
 
 | Command | What it does |
 |---|---|
-| `add <title>` | Add a task. Options: `-d/--due`, `-p/--priority`, `-t/--tag` (repeatable), `-e/--every` |
+| `add <title>` | Add a task. Options: `-d/--due`, `-p/--priority`, `-t/--tag` (repeatable), `-e/--every`, `--notes` |
 | `list` | List tasks. Options: `-t/--tag`, `-p/--priority`, `--search`, `--pending`, `-s/--sort id\|due\|priority` |
 | `today` | Unfinished tasks that are overdue or due today |
 | `show <id>` | Every detail of one task, including its notes |
-| `edit <id>` | Change a task: `--title`, `-d/--due`, `--no-due`, `-p/--priority`, `-t/--tag`, `--untag`, `-e/--every`, `--no-repeat` |
+| `edit <id>` | Change a task: `--title`, `-d/--due`, `--no-due`, `-p/--priority`, `-t/--tag`, `--untag`, `-e/--every`, `--no-repeat`, `--notes`, `--no-notes`, `--append-notes` |
 | `done <id>` | Mark a task as done |
 | `remove <id>` | Delete a task |
 | `undo` | Undo the last change; repeat to go further back |
@@ -180,7 +182,9 @@ undo history is lost.
 for example `#work #urgent`, because Apple doesn't let other apps read or set
 Reminders' own tags. You can see and edit that line on your phone. Tags added
 with the Reminders tag feature itself aren't visible to `todo`. Any other text
-in the notes is left untouched.
+in the notes is left untouched, and `--notes`, `--no-notes` and
+`--append-notes` change only that other text, never the hashtag line. Notes can
+only be set from the command line; the terminal UI form has no notes field.
 
 **Priorities** map to the ones in Reminders: high shows as `!!!`, medium as
 `!!` and low as `!` on your phone.

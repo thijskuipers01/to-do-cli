@@ -64,8 +64,11 @@ pub enum Command {
         /// Repeat the task: "day", "week", "2 weeks", "monthly", ... (starts today without --due)
         #[arg(short, long, value_parser = model::parse_repeat)]
         every: Option<Repeat>,
+        /// Notes to store with the task
+        #[arg(long)]
+        notes: Option<String>,
     },
-    /// Change the title, due date, priority, tags or repeat of a task
+    /// Change the title, due date, priority, tags, notes or repeat of a task
     Edit {
         /// ID of the task
         id: i64,
@@ -93,6 +96,15 @@ pub enum Command {
         /// Stop repeating the task
         #[arg(long)]
         no_repeat: bool,
+        /// Replace the notes (tags are kept)
+        #[arg(long, conflicts_with_all = ["no_notes", "append_notes"])]
+        notes: Option<String>,
+        /// Remove the notes (tags are kept)
+        #[arg(long, conflicts_with = "append_notes")]
+        no_notes: bool,
+        /// Add a line to the end of the notes
+        #[arg(long)]
+        append_notes: Option<String>,
     },
     /// List tasks
     List {
@@ -155,15 +167,29 @@ pub fn print_completions(shell: Shell, out: &mut impl Write) {
 /// and the changed task for `add`, `edit`, `done` and `remove`.
 pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Result<()> {
     match command {
-        Command::Add { title, due, priority, tags, every } => {
-            let task = db.add(&Task { due, priority, tags, repeat: every, ..Task::new(&title) })?;
+        Command::Add { title, due, priority, tags, every, notes } => {
+            let notes = notes.unwrap_or_default();
+            let task = db.add(&Task { due, priority, tags, notes, repeat: every, ..Task::new(&title) })?;
             if json {
                 display::print_task_json(&task)?;
             } else {
                 println!("Added task {}: {}", task.id, task.title);
             }
         }
-        Command::Edit { id, title, due, no_due, priority, tags, untags, every, no_repeat } => {
+        Command::Edit {
+            id,
+            title,
+            due,
+            no_due,
+            priority,
+            tags,
+            untags,
+            every,
+            no_repeat,
+            notes,
+            no_notes,
+            append_notes,
+        } => {
             if title.is_none()
                 && due.is_none()
                 && !no_due
@@ -172,6 +198,9 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
                 && untags.is_empty()
                 && every.is_none()
                 && !no_repeat
+                && notes.is_none()
+                && !no_notes
+                && append_notes.is_none()
             {
                 bail!("nothing to change; see `todo edit --help` for the options");
             }
@@ -194,6 +223,14 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
                 task.repeat = None;
             } else if every.is_some() {
                 task.repeat = every;
+            }
+            if no_notes {
+                task.notes.clear();
+            } else if let Some(notes) = notes {
+                task.notes = notes;
+            }
+            if let Some(line) = append_notes {
+                task.notes = append_line(&task.notes, &line);
             }
 
             let task = db.update(&task)?;
@@ -270,6 +307,14 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
     Ok(())
 }
 
+/// `notes` with `line` added as a new last line.
+fn append_line(notes: &str, line: &str) -> String {
+    match notes.trim_end() {
+        "" => line.to_string(),
+        notes => format!("{notes}\n{line}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,12 +337,13 @@ mod tests {
 
     #[test]
     fn add_with_every_option() {
-        let Command::Add { title, due, priority, tags, every } = command(&[
+        let Command::Add { title, due, priority, tags, every, notes } = command(&[
             "add", "Milk", "-d", "2026-10-20", "-p", "high", "-t", "home", "-t", "shop", "--every", "2 weeks",
+            "--notes", "Oat milk",
         ]) else {
             panic!("not an add command");
         };
-        assert_eq!(title, "Milk");
+        assert_eq!((title.as_str(), notes.as_deref()), ("Milk", Some("Oat milk")));
         assert_eq!(due, Some("2026-10-20".parse().unwrap()));
         assert_eq!((priority, tags), (Priority::High, vec!["home".into(), "shop".into()]));
         assert_eq!(every, Some(Repeat { unit: RepeatUnit::Week, interval: 2 }));
@@ -337,6 +383,9 @@ mod tests {
         for args in [
             &["edit", "1", "--due", "today", "--no-due"][..],
             &["edit", "1", "--every", "week", "--no-repeat"],
+            &["edit", "1", "--notes", "a", "--no-notes"],
+            &["edit", "1", "--notes", "a", "--append-notes", "b"],
+            &["edit", "1", "--no-notes", "--append-notes", "b"],
             &["add", "x", "--due", "someday"],
             &["add", "x", "--priority", "urgent"],
             &["add", "x", "--every", "fortnight"],
@@ -430,6 +479,35 @@ mod tests {
         let task = db.get(1).unwrap().unwrap();
         assert_eq!(task.repeat, Some(Repeat { unit: RepeatUnit::Month, interval: 1 }));
         assert_eq!(task.due, Some("2026-11-01".parse().unwrap()));
+    }
+
+    #[test]
+    fn notes_can_be_set_replaced_appended_and_cleared_without_losing_tags() {
+        let mut db = crate::test_store();
+        let notes = |db: &Store<_>| db.get(1).unwrap().unwrap().notes;
+        run(command(&["add", "Dentist", "-t", "health", "--notes", "Bring card"]), false, &mut db).unwrap();
+        assert_eq!(notes(&db), "Bring card");
+        assert_eq!(db.backend().data("memory-1").unwrap().notes, "Bring card\n#health");
+
+        run(command(&["edit", "1", "--append-notes", "Booked by phone"]), false, &mut db).unwrap();
+        assert_eq!(notes(&db), "Bring card\nBooked by phone");
+
+        run(command(&["edit", "1", "--notes", "Ask about X"]), false, &mut db).unwrap();
+        assert_eq!(notes(&db), "Ask about X");
+
+        run(command(&["edit", "1", "--no-notes"]), false, &mut db).unwrap();
+        assert_eq!(notes(&db), "");
+        run(command(&["edit", "1", "--append-notes", "First line"]), false, &mut db).unwrap();
+        assert_eq!(notes(&db), "First line");
+        assert_eq!(db.get(1).unwrap().unwrap().tags, ["health"]);
+        assert_eq!(db.backend().data("memory-1").unwrap().notes, "First line\n#health");
+    }
+
+    #[test]
+    fn append_line_skips_the_newline_for_empty_notes() {
+        assert_eq!(append_line("", "a"), "a");
+        assert_eq!(append_line("a\n", "b"), "a\nb");
+        assert_eq!(append_line("a", "b"), "a\nb");
     }
 
     #[test]
