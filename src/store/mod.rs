@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Local, TimeZone};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::Error;
@@ -32,18 +33,37 @@ CREATE TABLE IF NOT EXISTS ids (
 -- `before` is NULL when the change created the task (undoing it deletes the task).
 -- Rows with the same `batch` came from one command (`todo done 3 5 7`) and
 -- are undone together; `batch` is NULL for a change on its own.
+-- `at` is when the change was made (seconds since 1970); NULL for changes
+-- recorded before it existed.
 CREATE TABLE IF NOT EXISTS history (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     action  TEXT    NOT NULL,
     task_id INTEGER NOT NULL,
     before  TEXT,
-    batch   INTEGER
+    batch   INTEGER,
+    at      INTEGER
 );
 ";
 
 /// Columns added to `history` after the first release, with their types.
 /// Databases made before then get them through `ALTER TABLE`.
-const ADDED_HISTORY_COLUMNS: [(&str, &str); 1] = [("batch", "INTEGER")];
+const ADDED_HISTORY_COLUMNS: [(&str, &str); 2] = [("batch", "INTEGER"), ("at", "INTEGER")];
+
+/// One change in the undo history, as listed by [`Store::history`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Change {
+    /// "add", "edit", "done", "undone" or "remove".
+    pub action: String,
+    pub task_id: i64,
+    /// The task's title now or, if the task no longer exists, its last title
+    /// in the history. Empty if neither is known.
+    pub title: String,
+    /// When the change was made; `None` for changes made by older versions.
+    pub at: Option<DateTime<Local>>,
+    /// Changes with the same batch were made by one command and are undone
+    /// together; `None` for a change on its own.
+    pub batch: Option<i64>,
+}
 
 /// Tasks, stored in a reminders list `B`: the real Reminders app by default,
 /// or any other [`Backend`] such as [`MemoryList`](crate::MemoryList).
@@ -165,6 +185,37 @@ impl<B: Backend> Store<B> {
         }
         self.record("remove", id, Some(&before))?;
         Ok(before)
+    }
+
+    /// The `limit` most recent changes that `undo` can revert, newest first.
+    pub fn history(&self, limit: usize) -> Result<Vec<Change>> {
+        // action, task_id, before, batch, at
+        type Row = (String, i64, Option<String>, Option<i64>, Option<i64>);
+        let rows: Vec<Row> = self
+            .conn
+            .prepare("SELECT action, task_id, before, batch, at FROM history ORDER BY id DESC LIMIT ?1")?
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut changes = Vec::new();
+        for (action, task_id, before, batch, at) in rows {
+            let title = match self.get(task_id)? {
+                Some(task) => task.title,
+                // An "add" has no snapshot of its own; a later change may.
+                None => match before {
+                    Some(json) => Some(json),
+                    None => self.latest_snapshot(task_id)?,
+                }
+                .and_then(|json| serde_json::from_str::<Task>(&json).ok())
+                .map(|task| task.title)
+                .unwrap_or_default(),
+            };
+            let at = at.and_then(|seconds| Local.timestamp_opt(seconds, 0).single());
+            changes.push(Change { action, task_id, title, at, batch });
+        }
+        Ok(changes)
     }
 
     /// Marks several tasks as done or not done, as one change for `undo`.
@@ -292,6 +343,19 @@ impl<B: Backend> Store<B> {
         self.reminders.update(&reminder_id, &to_data(task))
     }
 
+    /// The most recent snapshot of task `task_id` in the history, as JSON.
+    fn latest_snapshot(&self, task_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT before FROM history WHERE task_id = ?1 AND before IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     fn reminder_id(&self, id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -308,8 +372,8 @@ impl<B: Backend> Store<B> {
     fn record(&self, action: &str, task_id: i64, before: Option<&Task>) -> Result<()> {
         let before = before.map(serde_json::to_string).transpose()?;
         self.conn.execute(
-            "INSERT INTO history (action, task_id, before, batch) VALUES (?1, ?2, ?3, ?4)",
-            params![action, task_id, before, self.batch],
+            "INSERT INTO history (action, task_id, before, batch, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![action, task_id, before, self.batch, Local::now().timestamp()],
         )?;
         Ok(())
     }
@@ -565,6 +629,45 @@ mod tests {
     }
 
     #[test]
+    fn history_lists_recent_changes_newest_first() {
+        let mut db = store();
+        assert!(db.history(10).unwrap().is_empty());
+        let before = Local::now().timestamp();
+        db.add(&Task::new("Milk")).unwrap();
+        db.add(&Task::new("Bread")).unwrap();
+        db.update(&Task { title: "Oat milk".into(), ..db.get(1).unwrap().unwrap() }).unwrap();
+        db.set_done_many(&[1, 2], true).unwrap();
+        db.remove(2).unwrap();
+
+        let history = db.history(10).unwrap();
+        let summary: Vec<(&str, i64, &str)> =
+            history.iter().map(|c| (c.action.as_str(), c.task_id, c.title.as_str())).collect();
+        assert_eq!(
+            summary,
+            [
+                ("remove", 2, "Bread"), // gone, so the title comes from the snapshot
+                ("done", 2, "Bread"),
+                ("done", 1, "Oat milk"),
+                ("edit", 1, "Oat milk"), // the current title
+                ("add", 2, "Bread"),
+                ("add", 1, "Oat milk"),
+            ]
+        );
+        assert!(history.iter().all(|c| c.at.unwrap().timestamp() >= before));
+        assert_eq!((history[0].batch, history[1].batch.is_some()), (None, true));
+        assert_eq!(history[1].batch, history[2].batch);
+        assert_eq!(db.history(2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn history_of_a_task_added_and_deleted_elsewhere_has_no_title() {
+        let mut db = store();
+        db.add(&Task::new("a")).unwrap();
+        db.backend().delete("memory-1").unwrap();
+        assert_eq!(db.history(1).unwrap()[0].title, "");
+    }
+
+    #[test]
     fn databases_from_older_versions_are_migrated() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -578,6 +681,7 @@ mod tests {
         db.set_done_many(&[1], true).unwrap();
         assert_eq!(db.undo().unwrap().as_deref(), Some("done of task 1"));
         assert_eq!(db.undo().unwrap().as_deref(), Some("add of task 1"));
+        assert_eq!(db.history(10).unwrap()[0].at, None, "the old row has no time");
         assert_eq!(db.undo().unwrap().as_deref(), Some("add of task 1"), "the old row");
     }
 

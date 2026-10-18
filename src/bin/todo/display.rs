@@ -5,7 +5,7 @@ use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use serde::Serialize;
 
-use todo::ListSummary;
+use todo::{Change, ListSummary};
 use todo::model::{self, DueStatus, Priority, Task};
 
 /// Prints tasks as a colored table. Colors are left out automatically when
@@ -58,6 +58,55 @@ fn lists_text(lists: &[ListSummary]) -> String {
         let _ = writeln!(out, "{:<width$}  {} open", list.name, list.open);
     }
     out
+}
+
+/// Prints the history as a table, newest change first.
+pub fn print_history(changes: &[Change]) {
+    if changes.is_empty() {
+        println!("No changes to undo.");
+    } else {
+        println!("{}", history_table(changes));
+    }
+}
+
+/// Prints the history as an array of
+/// `{"action", "id", "title", "at", "batch"}` objects, newest first.
+pub fn print_history_json(changes: &[Change]) -> serde_json::Result<()> {
+    println!("{}", serde_json::to_string_pretty(&history_json(changes))?);
+    Ok(())
+}
+
+fn history_json(changes: &[Change]) -> serde_json::Value {
+    changes
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "action": c.action,
+                "id": c.task_id,
+                "title": c.title,
+                "at": c.at.map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),
+                "batch": c.batch,
+            })
+        })
+        .collect()
+}
+
+fn history_table(changes: &[Change]) -> Table {
+    let mut table = Table::new();
+    table
+        .load_style(UTF8_FULL_CONDENSED.with_rounded_corners())
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["When", "Change", "ID", "Title"]);
+    for change in changes {
+        let when = change.at.map(|at| at.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
+        table.add_row(vec![
+            Cell::new(when),
+            Cell::new(&change.action),
+            Cell::new(change.task_id),
+            Cell::new(&change.title),
+        ]);
+    }
+    table
 }
 
 /// A task as JSON output shows it. Unlike `Task`'s own serialization (used
@@ -293,6 +342,26 @@ mod tests {
             lists_json(&lists),
             serde_json::json!([{ "name": "Shopping", "open": 3 }, { "name": "Todo", "open": 0 }])
         );
+    }
+
+    #[test]
+    fn history_as_table_and_json() {
+        use chrono::TimeZone;
+        let at = chrono::Local.with_ymd_and_hms(2026, 10, 18, 14, 3, 0).unwrap();
+        let changes = [
+            Change { action: "done".into(), task_id: 3, title: "Milk".into(), at: Some(at), batch: Some(2) },
+            Change { action: "add".into(), task_id: 1, title: "Old".into(), at: None, batch: None },
+        ];
+        let table = history_table(&changes).to_string();
+        for text in ["When", "2026-10-18 14:03", "done", "Milk", "add", "Old"] {
+            assert!(table.contains(text), "missing {text:?} in:\n{table}");
+        }
+        let json = history_json(&changes);
+        assert_eq!(json[0]["action"], "done");
+        assert_eq!(json[0]["id"], 3);
+        assert_eq!(json[0]["batch"], 2);
+        assert!(json[0]["at"].as_str().unwrap().starts_with("2026-10-18T14:03:00"));
+        assert!(json[1]["at"].is_null() && json[1]["batch"].is_null());
     }
 
     #[test]

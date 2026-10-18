@@ -186,6 +186,12 @@ pub enum Command {
     },
     /// Show all Reminders lists and how many unfinished tasks each has
     Lists,
+    /// Show the most recent changes, newest first
+    History {
+        /// How many changes to show
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+    },
     /// Undo the last change (can be repeated)
     Undo,
     /// Open the interactive terminal UI
@@ -362,6 +368,14 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
             }
         }
         Command::Lists => print_lists(&db.backend().lists()?, json)?,
+        Command::History { limit } => {
+            let changes = db.history(limit)?;
+            if json {
+                display::print_history_json(&changes)?;
+            } else {
+                display::print_history(&changes);
+            }
+        }
         Command::Undo => match (db.undo()?, json) {
             (what, true) => println!("{}", serde_json::json!({ "undone": what })),
             (Some(what), false) => println!("Undid {what}"),
@@ -514,6 +528,7 @@ mod tests {
             vec!["done", "1"],
             vec!["done", "2"],
             vec!["remove", "1"],
+            vec!["history"],
             vec!["undo"],
             vec!["lists"],
         ];
@@ -539,6 +554,7 @@ mod tests {
             vec!["undo", "--json"],
             vec!["undo", "--json"],
             vec!["lists", "--json"],
+            vec!["history", "-n", "3", "--json"],
         ] {
             let cli = parse(&args).unwrap();
             assert!(cli.json, "{args:?} should set --json");

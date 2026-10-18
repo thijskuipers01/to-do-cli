@@ -89,6 +89,7 @@ todo done 3
 todo done 3 5 7                                      # several at once
 todo remove 3
 todo lists                                           # which Reminders lists exist
+todo history                                         # recent changes, newest first
 todo undo                                            # repeat to go further back
 todo tui                                             # interactive mode
 ```
@@ -107,6 +108,7 @@ Run `todo --help` or `todo <command> --help` for every option.
 | `done <id>...` | Mark one or more tasks as done |
 | `remove <id>...` | Delete one or more tasks |
 | `lists` | All Reminders lists, with the number of unfinished tasks in each |
+| `history` | The most recent changes that `undo` can revert, newest first. Option: `-n/--limit` (default 10) |
 | `undo` | Undo the last change; repeat to go further back |
 | `tui` | Open the terminal UI |
 | `notify` | Show a macOS notification for tasks due tomorrow |
@@ -122,6 +124,10 @@ tasks, `show` prints one task, and `add`, `edit`, `done` and `remove` print the
 task they changed (so you get the ID of a new task back); `done` and `remove`
 with several IDs print an array. `undo` prints
 `{"undone": "..."}`, or `{"undone": null}` when there is nothing to undo.
+`history` prints `[{"action": "done", "id": 3, "title": "Milk", "at":
+"2026-10-18T14:03:00+02:00", "batch": 2}, ...]`, newest first; changes with
+the same `batch` came from one command and one `undo` reverts them all
+(`at` is `null` for changes made before `todo` recorded times).
 `lists` prints `[{"name": "Todo", "open": 4}, ...]`; use it to find the right
 list name, since `--list` creates a list that doesn't exist yet.
 

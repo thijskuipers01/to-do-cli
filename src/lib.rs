@@ -45,4 +45,4 @@ pub mod store;
 pub use error::{Error, ErrorKind};
 pub use model::{DueStatus, Priority, Repeat, RepeatUnit, Task};
 pub use reminders::{Backend, ListSummary, MemoryList, Reminder, ReminderData, RemindersList};
-pub use store::{Filter, SortKey, Store};
+pub use store::{Change, Filter, SortKey, Store};
