@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
-use chrono::{Days, NaiveDate};
+use chrono::NaiveDate;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use todo::model::{self, Due, Priority, Repeat, Task};
@@ -229,9 +229,7 @@ impl ListArgs {
             sort: self.sort,
         };
         if self.overdue {
-            let yesterday = today - Days::new(1);
-            filter.pending_only = true;
-            filter.due_by = Some(filter.due_by.map_or(yesterday, |by| by.min(yesterday)));
+            filter.only_overdue(today);
         }
         filter
     }

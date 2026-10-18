@@ -30,6 +30,8 @@ $ todo list --pending --sort due
 - **Tab completion** for zsh, bash and fish
 - **JSON output** (`--json`) for scripts and AI assistants, and a
   [Claude Code skill](skills/todo/SKILL.md) that teaches agents to use it
+- An **MCP server** (`todo-mcp`) that gives Claude Desktop, Claude Code and
+  other AI assistants the same actions as typed tools
 
 ## Requirements
 
@@ -263,6 +265,66 @@ all-day again. In JSON the time is a separate field, `"due_time": "15:00"`
 its next date and keeps a completed copy as a record. A repeating task needs a
 due date, so one without a date starts today.
 
+## MCP server
+
+`todo-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+server, so AI assistants can manage your tasks through typed tools instead of
+running shell commands. It's built on the same library and shares the task
+numbers and undo history with `todo`. Install it with the `mcp` feature:
+
+```sh
+cargo install --git https://github.com/thijskuipers01/to-do-cli --features mcp
+# or, from a local copy:
+cargo install --path . --features mcp
+```
+
+This installs both `todo` and `todo-mcp` in `~/.cargo/bin`.
+
+**Claude Code**:
+
+```sh
+claude mcp add todo --scope user -- ~/.cargo/bin/todo-mcp
+```
+
+**Claude Desktop**: open *Settings → Developer → Edit Config* and add the
+server to `claude_desktop_config.json` (use your own home folder; the path
+must be absolute), then restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "todo": {
+      "command": "/Users/you/.cargo/bin/todo-mcp"
+    }
+  }
+}
+```
+
+The first time a tool is used, macOS asks whether the app (Claude, or your
+terminal for Claude Code) may access Reminders. To use another default list
+than **Todo**, pass `"args": ["--list", "Work"]` or set `TODO_LIST` in
+`"env"`.
+
+| Tool | What it does |
+|---|---|
+| `list_tasks` | Tasks in a list, with the same filters as `todo list` (`pending`, `tag`, `priority`, `search`, `due_before`, `due_after`, `overdue`, `no_due`, `sort`) |
+| `get_task` | One task by ID |
+| `add_task` | Add a task (`title`, `due`, `priority`, `tags`, `notes`, `repeat`, `list`) |
+| `update_task` | Change a task; `null` clears `due`, `repeat` or `notes`; `dry_run` previews |
+| `complete_task` | Mark tasks done by `ids`; `dry_run` previews |
+| `remove_task` | Delete tasks by `ids`; `dry_run` previews |
+| `undo` | Revert the most recent change |
+| `history` | Recent changes, newest first |
+| `list_lists` | All Reminders lists with their open-task counts |
+
+Inputs use the same formats as the command-line options (`"friday 15:00"`,
+`"high"`, `"2 weeks"`) and results are the same JSON as `todo --json`.
+Problems come back as a tool error with `{"error": "not_found", "message":
+"..."}`, using the error kinds from [JSON output](#json-output). Unlike
+`--list`, `add_task` with a `list` that doesn't exist fails unless
+`create_list` is `true`, so a wrongly guessed list name doesn't create a new
+list.
+
 ## Shell completion
 
 With **Oh My Zsh**:
@@ -322,10 +384,10 @@ Run `cargo doc --open` for the full API documentation.
 
 ```sh
 cargo build
-cargo test                          # all tests, against an in-memory reminders list
+cargo test --all-features           # all tests, against an in-memory reminders list
 cargo test --no-default-features    # only the library
 cargo test -- --ignored             # integration tests against the real Reminders app
-cargo clippy --all-targets
+cargo clippy --all-targets --all-features
 ```
 
 The integration tests create temporary lists named `todo-cli-test-…` (they
@@ -337,6 +399,7 @@ sync to iCloud briefly) and delete them afterwards. They need Reminders access.
 src/
 ├── lib.rs                 library entry point and public API
 ├── error.rs               Error, ErrorKind
+├── json.rs                the JSON shapes of --json and the MCP server
 ├── model/                 data types, no storage
 │   ├── task.rs            Task, DueStatus
 │   ├── priority.rs        Priority
@@ -350,6 +413,10 @@ src/
 │   ├── mod.rs             short IDs, undo history (SQLite)
 │   ├── filter.rs          Filter, SortKey
 │   └── convert.rs         Task ↔ reminder conversion, tags as hashtags
+├── bin/todo-mcp/          the MCP server (needs the `mcp` feature)
+│   ├── main.rs            entry point, stdio loop
+│   ├── server.rs          the protocol: initialize, tools/list, tools/call
+│   └── tools.rs           the tools and their argument schemas
 └── bin/todo/              the command-line program (needs the `cli` feature)
     ├── main.rs            entry point
     ├── cli.rs             command-line options and running each command
