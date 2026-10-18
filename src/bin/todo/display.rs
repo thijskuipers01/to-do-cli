@@ -69,6 +69,8 @@ struct JsonTask<'a> {
     title: &'a str,
     done: bool,
     due: Option<NaiveDate>,
+    /// "15:00", or `None` for an all-day task.
+    due_time: Option<String>,
     priority: Option<&'static str>,
     tags: &'a [String],
     notes: &'a str,
@@ -83,6 +85,7 @@ impl<'a> From<&'a Task> for JsonTask<'a> {
             title: &task.title,
             done: task.done,
             due: task.due,
+            due_time: task.due.and(task.due_time).map(|t| t.format("%H:%M").to_string()),
             priority: match task.priority {
                 Priority::None => None,
                 priority => Some(priority.label()),
@@ -134,7 +137,7 @@ fn tasks_table(tasks: &[Task], today: NaiveDate) -> Table {
 fn task_details(task: &Task, today: NaiveDate) -> String {
     let dash = || "-".to_string();
     let due = match task.due {
-        Some(due) => format!("{due} ({})", relative_day(due, today)),
+        Some(due) => format!("{} ({})", task.due_text(), relative_day(due, today)),
         None => dash(),
     };
     let priority = match task.priority {
@@ -199,6 +202,7 @@ mod tests {
         Task {
             id: 7,
             due: Some(date("2026-10-20")),
+            due_time: Some("09:30:00".parse().unwrap()),
             priority: Priority::High,
             tags: vec!["work".into(), "urgent".into()],
             notes: "Bring the report\nand slides".into(),
@@ -214,7 +218,7 @@ mod tests {
         done.tags = vec!["home".into()];
         let table = tasks_table(&[full_task(), done], date("2026-10-17")).to_string();
 
-        for text in ["ID", "Title", "Weekly sync", "high", "2026-10-20 ↻", "work, urgent"] {
+        for text in ["ID", "Title", "Weekly sync", "high", "2026-10-20 09:30 ↻", "work, urgent"] {
             assert!(table.contains(text), "missing {text:?} in:\n{table}");
         }
         assert!(table.contains("Finished thing") && table.contains('✓'));
@@ -229,7 +233,7 @@ mod tests {
             "Task 7: Weekly sync\n\
              \x20 Status    open\n\
              \x20 List      Todo\n\
-             \x20 Due       2026-10-20 (in 3 days)\n\
+             \x20 Due       2026-10-20 09:30 (in 3 days)\n\
              \x20 Repeats   every 2 weeks\n\
              \x20 Priority  high\n\
              \x20 Tags      work, urgent\n\
@@ -260,6 +264,7 @@ mod tests {
                 "title": "Weekly sync",
                 "done": false,
                 "due": "2026-10-20",
+                "due_time": "09:30",
                 "priority": "high",
                 "tags": ["work", "urgent"],
                 "notes": "Bring the report\nand slides",
@@ -272,7 +277,7 @@ mod tests {
     #[test]
     fn json_uses_null_for_empty_fields() {
         let value = serde_json::to_value(JsonTask::from(&Task::new("Bare"))).unwrap();
-        for field in ["due", "priority", "repeat"] {
+        for field in ["due", "due_time", "priority", "repeat"] {
             assert!(value[field].is_null(), "{field} should be null: {value}");
         }
     }

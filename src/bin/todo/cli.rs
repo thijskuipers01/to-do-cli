@@ -7,10 +7,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use todo::model::{self, Priority, Repeat, Task};
+use todo::model::{self, Due, Priority, Repeat, Task};
 use todo::{Backend, Error, ErrorKind, Filter, ListSummary, SortKey, Store};
 
 use crate::{display, notify, tui};
@@ -93,9 +92,10 @@ pub enum Command {
     Add {
         /// The task description
         title: String,
-        /// Due date: YYYY-MM-DD, "today", "tomorrow" or a weekday ("friday")
-        #[arg(short, long, value_parser = model::parse_due)]
-        due: Option<NaiveDate>,
+        /// Due date: YYYY-MM-DD, "today", "tomorrow" or a weekday ("friday"),
+        /// optionally with a time: "friday 15:00", "tomorrow 3pm", "2026-10-23T15:00"
+        #[arg(short, long, value_parser = model::parse_due_time)]
+        due: Option<Due>,
         /// How urgent the task is
         #[arg(short, long, value_enum, default_value_t = Priority::None)]
         priority: Priority,
@@ -116,9 +116,9 @@ pub enum Command {
         /// New title
         #[arg(long)]
         title: Option<String>,
-        /// New due date (same formats as `add`)
-        #[arg(short, long, value_parser = model::parse_due, conflicts_with = "no_due")]
-        due: Option<NaiveDate>,
+        /// New due date, optionally with a time (same formats as `add`)
+        #[arg(short, long, value_parser = model::parse_due_time, conflicts_with = "no_due")]
+        due: Option<Due>,
         /// Remove the due date
         #[arg(long)]
         no_due: bool,
@@ -225,7 +225,15 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
     match command {
         Command::Add { title, due, priority, tags, every, notes } => {
             let notes = notes.unwrap_or_default();
-            let task = db.add(&Task { due, priority, tags, notes, repeat: every, ..Task::new(&title) })?;
+            let task = db.add(&Task {
+                due: due.map(|d| d.date),
+                due_time: due.and_then(|d| d.time),
+                priority,
+                tags,
+                notes,
+                repeat: every,
+                ..Task::new(&title)
+            })?;
             if json {
                 display::print_task_json(&task)?;
             } else {
@@ -266,9 +274,9 @@ pub fn run<B: Backend>(command: Command, json: bool, db: &mut Store<B>) -> Resul
                 task.title = title;
             }
             if no_due {
-                task.due = None;
-            } else if due.is_some() {
-                task.due = due;
+                (task.due, task.due_time) = (None, None);
+            } else if let Some(due) = due {
+                (task.due, task.due_time) = (Some(due.date), due.time);
             }
             if let Some(priority) = priority {
                 task.priority = priority;
@@ -414,7 +422,7 @@ mod tests {
             panic!("not an add command");
         };
         assert_eq!((title.as_str(), notes.as_deref()), ("Milk", Some("Oat milk")));
-        assert_eq!(due, Some("2026-10-20".parse().unwrap()));
+        assert_eq!(due, Some(Due { date: "2026-10-20".parse().unwrap(), time: None }));
         assert_eq!((priority, tags), (Priority::High, vec!["home".into(), "shop".into()]));
         assert_eq!(every, Some(Repeat { unit: RepeatUnit::Week, interval: 2 }));
     }
@@ -556,6 +564,24 @@ mod tests {
     }
 
     #[test]
+    fn due_times_are_set_changed_and_cleared() {
+        let mut db = crate::test_store();
+        let due = |db: &Store<_>| {
+            let task = db.get(1).unwrap().unwrap();
+            (task.due.map(|d| d.to_string()), task.due_time.map(|t| t.to_string()))
+        };
+        run(command(&["add", "Call mum", "--due", "2026-10-23T15:00"]), false, &mut db).unwrap();
+        assert_eq!(due(&db), (Some("2026-10-23".into()), Some("15:00:00".into())));
+        run(command(&["edit", "1", "--due", "2026-10-24 9am"]), false, &mut db).unwrap();
+        assert_eq!(due(&db), (Some("2026-10-24".into()), Some("09:00:00".into())));
+        run(command(&["edit", "1", "--due", "2026-10-25"]), false, &mut db).unwrap();
+        assert_eq!(due(&db), (Some("2026-10-25".into()), None), "a date alone makes it all-day");
+        run(command(&["edit", "1", "--due", "2026-10-25 18:30"]), false, &mut db).unwrap();
+        run(command(&["edit", "1", "--no-due"]), false, &mut db).unwrap();
+        assert_eq!(due(&db), (None, None));
+    }
+
+    #[test]
     fn notes_can_be_set_replaced_appended_and_cleared_without_losing_tags() {
         let mut db = crate::test_store();
         let notes = |db: &Store<_>| db.get(1).unwrap().unwrap().notes;
@@ -605,7 +631,7 @@ mod tests {
     fn argument_errors_become_short_messages() {
         let message = |args: &[&str]| clap_message(&parse(args).err().unwrap());
         assert_eq!(message(&["add", "x", "--bogus"]), "unexpected argument '--bogus' found");
-        assert!(message(&["add", "x", "--due", "someday"]).contains("expected YYYY-MM-DD"));
+        assert!(message(&["add", "x", "--due", "someday"]).contains("expected a date (YYYY-MM-DD"));
         assert!(message(&["add", "x", "--priority", "urgent"]).contains("urgent"));
     }
 

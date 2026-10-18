@@ -5,7 +5,7 @@ mod eventkit;
 mod memory;
 
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 
 use crate::model::Repeat;
 pub use eventkit::RemindersList;
@@ -18,6 +18,8 @@ pub struct ReminderData {
     pub notes: String,
     pub done: bool,
     pub due: Option<NaiveDate>,
+    /// Time of day the reminder is due; `None` for an all-day reminder.
+    pub due_time: Option<NaiveTime>,
     /// EventKit's scale: 0 = none, 1–4 = high, 5 = medium, 6–9 = low.
     pub priority: usize,
     pub repeat: Option<Repeat>,
@@ -31,6 +33,7 @@ impl ReminderData {
             notes: String::new(),
             done: false,
             due: None,
+            due_time: None,
             priority: 0,
             repeat: None,
         }

@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 use serde::{Deserialize, Serialize};
 
 use super::{Priority, Repeat};
@@ -14,6 +14,9 @@ pub struct Task {
     pub title: String,
     pub done: bool,
     pub due: Option<NaiveDate>,
+    /// Time of day the task is due, if any. Only meaningful with `due`.
+    #[serde(default)]
+    pub due_time: Option<NaiveTime>,
     pub priority: Priority,
     pub tags: Vec<String>,
     /// The reminder's notes, apart from the line of hashtags holding the tags.
@@ -41,6 +44,7 @@ impl Task {
             title: title.to_string(),
             done: false,
             due: None,
+            due_time: None,
             priority: Priority::None,
             tags: Vec::new(),
             notes: String::new(),
@@ -49,12 +53,21 @@ impl Task {
         }
     }
 
-    /// The due date as text, with "↻" added for repeating tasks.
-    pub fn due_label(&self) -> String {
-        match (self.due, self.repeat) {
-            (Some(due), Some(_)) => format!("{due} ↻"),
+    /// The due date and time as text ("2026-10-20 15:00"), without the time
+    /// for an all-day task.
+    pub fn due_text(&self) -> String {
+        match (self.due, self.due_time) {
+            (Some(due), Some(time)) => format!("{due} {}", time.format("%H:%M")),
             (Some(due), None) => due.to_string(),
             (None, _) => String::new(),
+        }
+    }
+
+    /// The due date and time as text, with "↻" added for repeating tasks.
+    pub fn due_label(&self) -> String {
+        match (self.due, self.repeat) {
+            (Some(_), Some(_)) => format!("{} ↻", self.due_text()),
+            _ => self.due_text(),
         }
     }
 
@@ -86,7 +99,7 @@ mod tests {
     fn new_task_has_only_a_title() {
         let task = Task::new("Buy milk");
         assert_eq!(task.title, "Buy milk");
-        assert_eq!((task.id, task.done, task.due, task.repeat), (0, false, None, None));
+        assert_eq!((task.id, task.done, task.due, task.due_time, task.repeat), (0, false, None, None, None));
         assert_eq!(task.priority, Priority::None);
         assert!(task.tags.is_empty() && task.notes.is_empty() && task.list.is_empty());
     }
@@ -99,6 +112,9 @@ mod tests {
         let weekly = Some(Repeat { unit: RepeatUnit::Week, interval: 1 });
         let repeating = Task { due, repeat: weekly, ..Task::new("a") };
         assert_eq!(repeating.due_label(), "2026-10-20 ↻");
+        let timed = Task { due_time: Some("15:00:00".parse().unwrap()), ..repeating };
+        assert_eq!(timed.due_label(), "2026-10-20 15:00 ↻");
+        assert_eq!(timed.due_text(), "2026-10-20 15:00");
     }
 
     #[test]
@@ -115,9 +131,9 @@ mod tests {
 
     #[test]
     fn old_undo_snapshots_without_new_fields_still_load() {
-        // Snapshots saved before `repeat` and `list` existed must still work.
+        // Snapshots saved before `repeat`, `list` and `due_time` existed must still work.
         let json = r#"{"id":1,"title":"Old","done":false,"due":null,"priority":"High","tags":[],"notes":""}"#;
         let task: Task = serde_json::from_str(json).unwrap();
-        assert_eq!((task.repeat, task.list.as_str()), (None, ""));
+        assert_eq!((task.repeat, task.list.as_str(), task.due_time), (None, "", None));
     }
 }

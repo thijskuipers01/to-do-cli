@@ -6,7 +6,7 @@ mod priority;
 mod repeat;
 mod task;
 
-pub use dates::{parse_due, today};
+pub use dates::{Due, parse_due, parse_due_time, today};
 pub use priority::Priority;
 pub use repeat::{Repeat, RepeatUnit, parse_repeat};
 pub use task::{DueStatus, Task};

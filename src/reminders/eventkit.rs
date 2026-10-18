@@ -6,14 +6,15 @@ use std::sync::mpsc;
 
 use anyhow::{Context, Result, anyhow};
 use block2::RcBlock;
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate, NaiveTime, TimeZone, Timelike};
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
 use objc2_event_kit::{
-    EKCalendar, EKEntityType, EKEventStore, EKRecurrenceFrequency, EKRecurrenceRule, EKReminder,
+    EKAlarm, EKCalendar, EKEntityType, EKEventStore, EKRecurrenceFrequency, EKRecurrenceRule,
+    EKReminder,
 };
-use objc2_foundation::{NSArray, NSDateComponents, NSError, NSPredicate, NSString};
+use objc2_foundation::{NSArray, NSDate, NSDateComponents, NSError, NSPredicate, NSString};
 
 use super::{Backend, ListSummary, Reminder, ReminderData, summarize};
 use crate::error::{Error, ErrorKind};
@@ -61,11 +62,10 @@ impl RemindersList {
             if reminder.isCompleted() != data.done {
                 reminder.setCompleted(data.done);
             }
-            // Only touch the due date when it changes, so a time of day set on
-            // the iPhone survives edits made here.
-            if due_date(reminder) != data.due {
-                let components = data.due.map(date_components);
-                reminder.setDueDateComponents(components.as_deref());
+            // Only touch the due date when it changes, so alarms set on the
+            // iPhone survive edits made here.
+            if due_of(reminder) != (data.due, data.due_time) {
+                set_due(reminder, data.due, data.due_time);
             }
             // Same for the repeat rule, so more complex rules made on the
             // iPhone (e.g. "every Monday and Thursday") aren't overwritten.
@@ -208,7 +208,8 @@ fn to_reminder(reminder: &EKReminder) -> Reminder {
                 title: reminder.title().to_string(),
                 notes: reminder.notes().map(|n| n.to_string()).unwrap_or_default(),
                 done: reminder.isCompleted(),
-                due: due_date(reminder),
+                due: due_of(reminder).0,
+                due_time: due_of(reminder).1,
                 priority: reminder.priority(),
                 repeat: repeat_of(reminder),
             },
@@ -249,25 +250,53 @@ fn recurrence_rule(repeat: Repeat) -> Retained<EKRecurrenceRule> {
     }
 }
 
-/// The due date without its time of day. Unset components hold a huge
-/// placeholder value, which fails the conversions and gives `None`.
-fn due_date(reminder: &EKReminder) -> Option<NaiveDate> {
-    let c = unsafe { reminder.dueDateComponents() }?;
-    let (year, month, day) = (c.year(), c.month(), c.day());
-    NaiveDate::from_ymd_opt(
-        year.try_into().ok()?,
-        month.try_into().ok()?,
-        day.try_into().ok()?,
-    )
+/// The due date and, unless it's an all-day reminder, the time of day.
+/// Unset components hold a huge placeholder value, which fails the
+/// conversions and gives `None`.
+fn due_of(reminder: &EKReminder) -> (Option<NaiveDate>, Option<NaiveTime>) {
+    let Some(c) = (unsafe { reminder.dueDateComponents() }) else {
+        return (None, None);
+    };
+    let date = (|| {
+        NaiveDate::from_ymd_opt(c.year().try_into().ok()?, c.month().try_into().ok()?, c.day().try_into().ok()?)
+    })();
+    let time = (|| NaiveTime::from_hms_opt(c.hour().try_into().ok()?, c.minute().try_into().ok()?, 0))();
+    (date, date.and(time))
 }
 
-/// A date with no time of day, which Reminders shows as an all-day due date.
-fn date_components(date: NaiveDate) -> Retained<NSDateComponents> {
+/// A date, with a time of day or without one (an all-day due date).
+fn date_components(date: NaiveDate, time: Option<NaiveTime>) -> Retained<NSDateComponents> {
     let components = NSDateComponents::new();
     components.setYear(date.year() as isize);
     components.setMonth(date.month() as isize);
     components.setDay(date.day() as isize);
+    if let Some(time) = time {
+        components.setHour(time.hour() as isize);
+        components.setMinute(time.minute() as isize);
+    }
     components
+}
+
+/// Sets the due date and time, and an alarm at that time so Reminders
+/// notifies you. Alarms at another fixed time (such as one for the old due
+/// time) are removed; other alarms, like location-based ones, are kept.
+fn set_due(reminder: &EKReminder, date: Option<NaiveDate>, time: Option<NaiveTime>) {
+    let components = date.map(|date| date_components(date, time));
+    let alert_at = date.zip(time).and_then(|(date, time)| {
+        let local = Local.from_local_datetime(&date.and_time(time)).earliest()?;
+        Some(NSDate::dateWithTimeIntervalSince1970(local.timestamp() as f64))
+    });
+    unsafe {
+        reminder.setDueDateComponents(components.as_deref());
+        let mut alarms: Vec<Retained<EKAlarm>> = reminder
+            .alarms()
+            .map(|alarms| alarms.iter().filter(|alarm| alarm.absoluteDate().is_none()).collect())
+            .unwrap_or_default();
+        if let Some(at) = alert_at {
+            alarms.push(EKAlarm::alarmWithAbsoluteDate(&at));
+        }
+        reminder.setAlarms(Some(&NSArray::from_retained_slice(&alarms)));
+    }
 }
 
 fn ns_error(error: Retained<NSError>) -> anyhow::Error {
@@ -288,6 +317,7 @@ mod tests {
             notes: String::new(),
             done: false,
             due: None,
+            due_time: None,
             priority: 0,
             repeat: None,
         }
@@ -300,23 +330,52 @@ mod tests {
         unsafe { EKReminder::reminderWithEventStore(&store) }
     }
 
+    fn time(text: &str) -> NaiveTime {
+        text.parse().unwrap()
+    }
+
+    fn absolute_alarms(reminder: &EKReminder) -> Vec<f64> {
+        let alarms = unsafe { reminder.alarms() }.map(|a| a.to_vec()).unwrap_or_default();
+        alarms.iter().filter_map(|a| unsafe { a.absoluteDate() }).map(|d| d.timeIntervalSince1970()).collect()
+    }
+
     #[test]
     fn due_date_round_trips_through_date_components() {
         let reminder = unsaved_reminder();
-        assert_eq!(due_date(&reminder), None);
+        assert_eq!(due_of(&reminder), (None, None));
         for text in ["2026-10-20", "2027-02-28", "2028-02-29"] {
-            unsafe { reminder.setDueDateComponents(Some(&date_components(date(text)))) };
-            assert_eq!(due_date(&reminder), Some(date(text)));
+            unsafe { reminder.setDueDateComponents(Some(&date_components(date(text), None))) };
+            assert_eq!(due_of(&reminder), (Some(date(text)), None));
         }
     }
 
     #[test]
-    fn due_date_ignores_the_time_of_day() {
+    fn due_time_round_trips_through_date_components() {
         let reminder = unsaved_reminder();
-        let components = date_components(date("2026-10-20"));
-        components.setHour(14);
-        unsafe { reminder.setDueDateComponents(Some(&components)) };
-        assert_eq!(due_date(&reminder), Some(date("2026-10-20")));
+        for text in ["00:00:00", "09:05:00", "15:30:00", "23:59:00"] {
+            let components = date_components(date("2026-10-20"), Some(time(text)));
+            unsafe { reminder.setDueDateComponents(Some(&components)) };
+            assert_eq!(due_of(&reminder), (Some(date("2026-10-20")), Some(time(text))));
+        }
+    }
+
+    #[test]
+    fn set_due_adds_and_replaces_the_alarm() {
+        let reminder = unsaved_reminder();
+        let location_alarm = unsafe { EKAlarm::alarmWithRelativeOffset(-600.0) };
+        unsafe { reminder.addAlarm(&location_alarm) };
+
+        set_due(&reminder, Some(date("2026-10-20")), Some(time("15:00:00")));
+        let expected = Local.with_ymd_and_hms(2026, 10, 20, 15, 0, 0).unwrap().timestamp() as f64;
+        assert_eq!(absolute_alarms(&reminder), [expected]);
+
+        set_due(&reminder, Some(date("2026-10-21")), None);
+        assert_eq!(due_of(&reminder), (Some(date("2026-10-21")), None));
+        assert!(absolute_alarms(&reminder).is_empty(), "the old alarm is gone");
+        assert_eq!(unsafe { reminder.alarms() }.unwrap().len(), 1, "other alarms are kept");
+
+        set_due(&reminder, None, None);
+        assert_eq!(due_of(&reminder), (None, None));
     }
 
     #[test]
@@ -340,7 +399,7 @@ mod tests {
             reminder.setTitle(Some(&NSString::from_str("Dentist")));
             reminder.setNotes(Some(&NSString::from_str("#health")));
             reminder.setPriority(5);
-            reminder.setDueDateComponents(Some(&date_components(date("2026-10-20"))));
+            reminder.setDueDateComponents(Some(&date_components(date("2026-10-20"), Some(time("08:15:00")))));
             reminder.setCompleted(true);
         }
         let read = to_reminder(&reminder).data;
@@ -351,6 +410,7 @@ mod tests {
                 notes: "#health".into(),
                 done: true,
                 due: Some(date("2026-10-20")),
+                due_time: Some(time("08:15:00")),
                 priority: 5,
                 repeat: None,
             }
@@ -394,6 +454,7 @@ mod tests {
             let mut written = ReminderData {
                 notes: "Bring report\n#work".into(),
                 due: Some(date("2030-01-15")),
+                due_time: Some(time("15:00:00")),
                 priority: 1,
                 repeat: Some(Repeat { unit: RepeatUnit::Week, interval: 2 }),
                 ..data("Integration test")
@@ -405,6 +466,7 @@ mod tests {
 
             written.title = "Renamed".into();
             written.due = None;
+            written.due_time = None;
             written.repeat = None;
             list.update(&id, &written).unwrap();
             assert_eq!(list.get(&id).unwrap().data, written);

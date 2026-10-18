@@ -74,6 +74,7 @@ history as well.
 ```sh
 todo add "Buy milk"                                  # just a title
 todo add "Report" -d friday -p high -t work          # due date, priority, tag
+todo add "Call mum" --due "friday 15:00"             # due time, with an alert
 todo add "Water plants" --every week                 # repeating, starts today
 todo list                                            # everything
 todo list --pending --sort due                       # open tasks, soonest first
@@ -131,6 +132,7 @@ $ todo add "Dentist" --due friday --priority high --tag health --json
   "title": "Dentist",
   "done": false,
   "due": "2026-10-23",
+  "due_time": null,
   "priority": "high",
   "tags": [
     "health"
@@ -168,6 +170,7 @@ with exit code 1, or 2 for a mistake in the options.
 | What | Accepted values |
 |---|---|
 | Due date | `2026-10-20`, `today`, `tomorrow`, or a weekday such as `friday`/`fri` (the next one after today) |
+| Due time (optional) | after the date: `friday 15:00`, `tomorrow 3pm`, `2026-10-23 9:30am`, `2026-10-23T15:00`; a time alone (`15:00`) means today |
 | Priority | `none` (default), `low`, `medium`, `high` |
 | Repeat | `day`, `week`, `month`, `year`, optionally with a number and/or "every": `2 weeks`, `every 3 days`, `monthly` |
 
@@ -217,6 +220,12 @@ only be set from the command line; the terminal UI form has no notes field.
 checked first: if one doesn't exist, nothing is changed. One `undo` reverts
 the whole command.
 
+**Due times.** A task with a time (`--due "friday 15:00"`) also gets an
+alert at that time in Reminders, so your iPhone notifies you. Changing the
+due time moves the alert; giving only a date (`--due friday`) makes the task
+all-day again. In JSON the time is a separate field, `"due_time": "15:00"`
+(`null` for all-day tasks), next to `"due"`.
+
 **Repeating tasks** work like they do in Reminders: completing one moves it to
 its next date and keeps a completed copy as a record. A repeating task needs a
 due date, so one without a date starts today.
@@ -248,7 +257,6 @@ automatically, schedule `todo notify` with launchd.
 ## Limitations
 
 - macOS only. EventKit, the Reminders framework, doesn't exist elsewhere.
-- Due dates are whole days; a time of day set on the iPhone is kept but not shown.
 - Undoing a change overwrites edits made to that task on another device in
   the meantime. Undoing the completion of a repeating task leaves its completed
   copy in place.

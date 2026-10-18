@@ -17,14 +17,15 @@ pub enum SortKey {
 impl SortKey {
     /// Sorts `tasks` in place. Ties are broken so the order is always the same.
     pub fn sort(self, tasks: &mut [Task]) {
-        // `(due.is_none(), due)` puts tasks without a due date last.
+        // `(due.is_none(), due)` puts tasks without a due date last. On the same
+    // day, all-day tasks (no time) come before timed ones.
         match self {
             SortKey::Id => tasks.sort_by_key(|t| t.id),
             SortKey::Due => {
-                tasks.sort_by_key(|t| (t.due.is_none(), t.due, Reverse(t.priority), t.id))
+                tasks.sort_by_key(|t| (t.due.is_none(), t.due, t.due_time, Reverse(t.priority), t.id))
             }
             SortKey::Priority => {
-                tasks.sort_by_key(|t| (Reverse(t.priority), t.due.is_none(), t.due, t.id))
+                tasks.sort_by_key(|t| (Reverse(t.priority), t.due.is_none(), t.due, t.due_time, t.id))
             }
         }
     }
